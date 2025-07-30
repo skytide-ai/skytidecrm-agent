@@ -1,0 +1,12 @@
+{
+  "app": "skytide-app-1",
+  "payload": {
+    "sender": {
+      "phone": "573212498342"
+    },
+    "message": {
+      "type": "text",
+      "text": "Hola, quiero saber sobre la limpieza facial"
+    }
+  }
+} 
