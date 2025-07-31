@@ -103,7 +103,7 @@ router.post('/gupshup', resolveOrganization, resolveChatIdentity, async (req, re
     }
 
     // 3. CONSTRUIR PAYLOAD OPTIMIZADO PARA PYTHON SERVICE
-    const pythonServiceUrl = `${process.env.PYTHON_SERVICE_URL}/invoke`;
+    const pythonServiceUrl = `${process.env.PYTHON_API_URL}/invoke`;
     
     const payload = {
       organizationId: req.organizationId,

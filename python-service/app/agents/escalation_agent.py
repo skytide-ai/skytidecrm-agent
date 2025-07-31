@@ -14,7 +14,6 @@ async def handle_human_escalation(organization_id: str, chat_identity_id: str, r
     """
     print(f"--- ¡ESCALACIÓN HUMANA! ---")
     print(f"Chat ID: {chat_identity_id}")
-    print(f"Contact ID: {contact_id}")
     print(f"Razón: {reason}")
     
     try:

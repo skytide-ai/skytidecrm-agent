@@ -93,7 +93,7 @@ const resolveChatIdentity = async (req, res, next) => {
     console.log(`Resolving chat identity for organization: ${req.organizationId}, phone: ${phone}`);
 
     // 1. Buscar chat_identity existente
-    const { data: existingChatIdentity, error: searchError } = await supabaseClient
+    const { data: existingChatIdentity, error: searchError } = await supabase
       .from('chat_identities')
       .select('id, contact_id')
       .eq('organization_id', req.organizationId)
@@ -116,7 +116,7 @@ const resolveChatIdentity = async (req, res, next) => {
       console.log(`Existing chat identity found: ${chatIdentityId}, contact_id: ${contactId}`);
       
       // Actualizar last_seen
-      await supabaseClient
+      await supabase
         .from('chat_identities')
         .update({ last_seen: new Date().toISOString() })
         .eq('id', chatIdentityId);

@@ -1,7 +1,7 @@
 from typing import Literal
 from openai import OpenAI
 import pydantic_ai
-from langchain_core.pydantic_v1 import BaseModel, Field
+from pydantic import BaseModel, Field
 
 # Importamos el estado global
 from .state import GlobalState
