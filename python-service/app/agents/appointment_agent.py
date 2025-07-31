@@ -1,5 +1,6 @@
 from typing import Dict, Any, List, Optional
 import datetime
+import os
 from pydantic import BaseModel, Field
 import pydantic_ai
 from openai import OpenAI
@@ -9,8 +10,15 @@ from pydantic_ai import Agent, RunContext
 from ..state import GlobalState
 from ..db import supabase_client
 
-# --- Cliente Pydantic AI ---
-client = OpenAI()
+# --- Cliente Pydantic AI con OpenRouter ---
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+    default_headers={
+        "HTTP-Referer": "https://skytidecrm.com",
+        "X-Title": "SkytideCRM Agent",
+    }
+)
 
 # --- Modelos de Datos para Herramientas ---
 class AvailabilitySlot(BaseModel):
@@ -30,7 +38,7 @@ class AppointmentInfo(BaseModel):
 
 # --- Definición del Agente de Citas ---
 appointment_agent = Agent(
-    'openai:gpt-4-turbo',
+    client,  # Usamos el cliente configurado para OpenRouter
     system_prompt="""
     Eres un asistente experto en la gestión de citas. Tu trabajo es guiar al usuario a través del proceso de agendamiento, consulta, cancelación y reprogramación.
 
@@ -240,7 +248,7 @@ async def book_appointment(
             )
 
         appointment_id = response.data[0]['id']
-            print(f"Cita creada con éxito. ID: {appointment_id}")
+        print(f"Cita creada con éxito. ID: {appointment_id}")
 
         # 2. Verificar el estado de opt-in/opt-out de WhatsApp para el contacto
         auth_response = await supabase_client.table('contact_authorizations').select('authorization_type').eq('contact_id', contact_id).eq('channel', 'whatsapp').order('created_at', desc=True).limit(1).maybe_single().execute()

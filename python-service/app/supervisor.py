@@ -1,4 +1,5 @@
 from typing import Literal
+import os
 from openai import OpenAI
 import pydantic_ai
 from pydantic import BaseModel, Field
@@ -6,10 +7,18 @@ from pydantic import BaseModel, Field
 # Importamos el estado global
 from .state import GlobalState
 
-# --- Cliente Pydantic AI ---
-# Creamos un cliente de OpenAI y lo parcheamos con pydantic_ai
+# --- Cliente Pydantic AI con OpenRouter ---
+# Creamos un cliente de OpenAI configurado para OpenRouter y lo parcheamos con pydantic_ai
 # Esto nos permite usar el parámetro `response_model` en las llamadas al LLM
-client = pydantic_ai.patch(OpenAI())
+openai_client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+    default_headers={
+        "HTTP-Referer": "https://skytidecrm.com",  # Tu sitio web
+        "X-Title": "SkytideCRM Agent",  # Nombre de tu app
+    }
+)
+client = pydantic_ai.patch(openai_client)
 
 # 1. Definimos los nombres de nuestros agentes
 AGENT_NAMES = ("KnowledgeAgent", "AppointmentAgent", "EscalationAgent")
@@ -60,9 +69,9 @@ def supervisor_node(state: GlobalState) -> dict:
         }
     ]
 
-    # Invocamos al cliente de OpenAI parcheado con pydantic_ai
+    # Invocamos al cliente de OpenRouter parcheado con pydantic_ai
     result: SupervisorOutput = client.chat.completions.create(
-        model="gpt-4-turbo",
+        model="openai/gpt-4o",  # Modelo de OpenAI a través de OpenRouter
         response_model=SupervisorOutput,
         messages=prompt_messages
     )

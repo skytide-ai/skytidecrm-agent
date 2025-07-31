@@ -1,4 +1,5 @@
 from typing import Dict, Any, List, Optional
+import os
 from pydantic import BaseModel, Field
 import pydantic_ai
 from openai import OpenAI
@@ -7,10 +8,17 @@ from pydantic_ai import Agent, RunContext
 # Importamos el estado global
 from ..state import GlobalState
 
-# --- Cliente Pydantic AI ---
-# Usamos un cliente de OpenAI independiente para este agente
+# --- Cliente Pydantic AI con OpenRouter ---
+# Usamos un cliente de OpenAI configurado para OpenRouter
 # para mantener los contextos de herramientas separados.
-client = OpenAI()
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+    default_headers={
+        "HTTP-Referer": "https://skytidecrm.com",
+        "X-Title": "SkytideCRM Agent",
+    }
+)
 
 # --- Simulación de la Base de Datos ---
 MOCK_SERVICES_DB = [
@@ -22,7 +30,7 @@ MOCK_SERVICES_DB = [
 
 # --- Definición del Agente de Conocimiento ---
 knowledge_agent = Agent(
-    'openai:gpt-4-turbo', 
+    client,  # Usamos el cliente configurado para OpenRouter
     system_prompt="""
     Eres un asistente experto en la oferta de servicios de un centro de estética.
     Tu trabajo es ayudar al usuario a encontrar y seleccionar el servicio que desea.
