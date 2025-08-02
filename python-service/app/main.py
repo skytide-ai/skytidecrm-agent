@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
-from typing import Optional
+from typing import Optional, Dict, Any
 
 # Importamos nuestro estado global, nodos y el supervisor
 from .state import GlobalState
@@ -13,8 +13,15 @@ from .agents.appointment_agent import run_appointment_agent
 from .agents.escalation_agent import run_escalation_agent
 from .supervisor import supervisor_node, TERMINATE
 
-# Importamos el cliente de Zep
-from .zep import zep_client
+# Importamos las funciones de Zep Cloud
+from .zep import (
+    zep_client,
+    ensure_user_exists,
+    ensure_thread_exists,
+    add_messages_to_zep,
+    get_zep_memory_context,
+    update_zep_user_with_real_data
+)
 
 # --- 1. Definición del Grafo de LangGraph ---
 # El grafo se define igual, pero se compila sin checkpointer
@@ -34,6 +41,20 @@ workflow.add_edge("EscalationAgent", "Supervisor")
 
 def route_next(state: GlobalState):
     next_agent = state.get("next_agent")
+    
+    # Si hay una respuesta directa del supervisor, crear el mensaje AI y terminar
+    if state.get("direct_response"):
+        direct_response = state["direct_response"]
+        print(f"🎯 Procesando respuesta directa del Supervisor: {direct_response[:100]}...")
+        
+        # Agregar el mensaje AI directamente al estado
+        ai_message = AIMessage(content=direct_response)
+        current_messages = state.get("messages", [])
+        current_messages.append(ai_message)
+        state["messages"] = current_messages
+        
+        return END
+    
     if next_agent == TERMINATE or not next_agent:
         return END
     return next_agent
@@ -45,13 +66,45 @@ workflow.add_conditional_edges(
         "KnowledgeAgent": "KnowledgeAgent",
         "AppointmentAgent": "AppointmentAgent",
         "EscalationAgent": "EscalationAgent",
-        TERMINATE: END
+        TERMINATE: END,
+        END: END  # Mapeo directo para cuando route_next devuelve END
     }
 )
 
 # --- 2. Compilación del Grafo con Checkpointer ---
 memory_saver = MemorySaver()
 app_graph = workflow.compile(checkpointer=memory_saver)
+
+# --- 3. Funciones auxiliares para Zep ---
+
+async def get_contact_data(contact_id: str, organization_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Obtiene los datos reales del contacto desde Supabase.
+    
+    Returns:
+        Dict con first_name, last_name, phone, etc. o None si no se encuentra
+    """
+    try:
+        from .db import supabase_client
+        
+        response = await supabase_client.table('contacts')\
+            .select('first_name, last_name, phone, country_code')\
+            .eq('id', contact_id)\
+            .eq('organization_id', organization_id)\
+            .maybe_single()\
+            .execute()
+        
+        if response.data:
+            return response.data
+        else:
+            print(f"❌ No se encontró contacto con ID: {contact_id}")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Error obteniendo datos del contacto {contact_id}: {e}")
+        return None
+
+
 
 
 # --- 3. FastAPI App ---
@@ -71,88 +124,108 @@ app = FastAPI()
 def read_root():
     return {"Hello": "World"}
 
+@app.post("/chat")
+async def chat(payload: InvokePayload):
+    """
+    Ruta de chat para pruebas y desarrollo.
+    Alias de /invoke con el mismo comportamiento.
+    """
+    return await invoke(payload)
+
 @app.post("/invoke")
 async def invoke(payload: InvokePayload):
+    session_id = payload.chatIdentityId  # Este es nuestro thread_id
+    user_id = f"chat_{payload.chatIdentityId}" # ID de usuario único para Zep
+
     try:
-        session_id = payload.phone
-        config = {"configurable": {"thread_id": session_id}}
-
         # 1. Validaciones básicas
-        user_input = payload.message
-        if not user_input:
+        if not payload.message:
             return {"status": "error", "message": "No user input found in payload."}
-        
-        if not payload.organizationId:
-            return {"status": "error", "message": "Organization ID is required."}
-            
-        if not payload.chatIdentityId:
-            return {"status": "error", "message": "Chat Identity ID is required."}
+        if not payload.organizationId or not payload.chatIdentityId:
+            return {"status": "error", "message": "OrganizationId and ChatIdentityId are required."}
 
-        # 2. Construir la entrada para el grafo con datos ya resueltos por el Gateway
-        # El checkpointer se encargará de cargar el estado anterior si existe.
-        initial_input = GlobalState(
-            messages=[HumanMessage(content=user_input)],
+        print(f"--- Iniciando gestión para Thread: {session_id} ---")
+
+        # 2. Gestión de Usuario y Thread en Zep (ANTES de invocar el grafo)
+        # 2.1. Determinar datos del usuario
+        first_name, last_name = "Usuario", ""
+        if payload.contactId:
+            contact_data = await get_contact_data(payload.contactId, payload.organizationId)
+            if contact_data:
+                first_name = contact_data.get("first_name", "Usuario")
+                last_name = contact_data.get("last_name", "")
+                print(f"✅ Datos del contacto obtenidos: {first_name} {last_name}")
+
+        # 2.2. Asegurar que el usuario y el thread existen
+        await ensure_user_exists(user_id, first_name, last_name, "")
+        await ensure_thread_exists(session_id, user_id)
+        
+        # 2.3. Añadir el mensaje del USUARIO al historial de Zep ANTES de pensar
+        from zep_cloud import Message
+        user_message = Message(role="user", content=payload.message)
+        await add_messages_to_zep(session_id, [user_message])
+        print(f"✅ Mensaje del usuario añadido a Zep para el thread: {session_id}")
+
+        # 3. Preparar e invocar el grafo
+        config = {"configurable": {"thread_id": session_id}}
+        
+        # El estado inicial solo necesita los datos clave, LangGraph cargará el historial
+        initial_state = GlobalState(
+            messages=[HumanMessage(content=payload.message)], # Solo el mensaje actual para iniciar
             organization_id=payload.organizationId,
-            chat_identity_id=payload.chatIdentityId,    # ⭐ NUEVO: Pre-resuelto
-            contact_id=payload.contactId,               # ⭐ NUEVO: Pre-resuelto
-            phone=payload.phone,                        # Número completo (platform_user_id)
-            phone_number=payload.phoneNumber,           # Número nacional (dial_code)
-            country_code=payload.countryCode            # Código de país (con +)
+            chat_identity_id=payload.chatIdentityId,
+            contact_id=payload.contactId,
+            phone=payload.phone,
+            phone_number=payload.phoneNumber,
+            country_code=payload.countryCode
         )
 
-        # 3. Invocar el grafo con la configuración del thread_id
         print(f"--- Invocando grafo para la sesión: {session_id} ---")
-        print(f"    Chat Identity ID: {payload.chatIdentityId}")
-        print(f"    Contact ID: {payload.contactId}")
-        final_state_result = await app_graph.ainvoke(initial_input, config)
-        print(f"--- Grafo finalizado para la sesión: {session_id} ---")
+        # Agregar recursion_limit para evitar bucles infinitos
+        config_with_limit = {**config, "recursion_limit": 50}
+        
+        try:
+            final_state_result = await app_graph.ainvoke(initial_state, config_with_limit)
+            print(f"--- Grafo finalizado para la sesión: {session_id} ---")
+        except Exception as graph_error:
+            print(f"❌ Error en grafo: {graph_error}")
+            print(f"🔍 Intentando capturar el último estado válido...")
+            
+            # Usar stream para capturar estados intermedios
+            last_valid_state = initial_state
+            try:
+                async for state_update in app_graph.astream(initial_state, config_with_limit):
+                    print(f"📡 Estado capturado: {list(state_update.keys())}")
+                    # Actualizar con el último estado válido
+                    for node_name, node_state in state_update.items():
+                        if node_state.get("messages"):
+                            last_valid_state = node_state
+                            print(f"💾 Estado guardado de {node_name}: {len(node_state['messages'])} mensajes")
+            except Exception as stream_error:
+                print(f"❌ Error en stream: {stream_error}")
+            
+            final_state_result = last_valid_state
 
-        final_state = final_state_result
-
-        # 4. Extraer la respuesta final de la IA
-        ai_response_content = ""
-        if final_state.get("messages") and isinstance(final_state["messages"][-1], BaseMessage):
-            last_message = final_state["messages"][-1]
+        # 4. Extraer y guardar la respuesta de la IA
+        ai_response_content = "No he podido procesar tu solicitud. Por favor, intenta de nuevo."
+        if final_state_result.get("messages"):
+            last_message = final_state_result["messages"][-1]
             if isinstance(last_message, AIMessage):
                 ai_response_content = last_message.content
-
-        if not ai_response_content:
-            ai_response_content = "No he podido procesar tu solicitud. Por favor, intenta de nuevo."
-
-        # 5. Guardar SOLO los mensajes en Zep (sin el estado)
-        # LangGraph y el checkpointer ya se encargaron de la persistencia del estado.
-        try:
-            from zep_python import Message
-            
-            user_message_to_save = Message(role="human", content=user_input)
-            ai_message_to_save = Message(
-                role="ai",
-                content=ai_response_content,
-                # Ya no guardamos el estado en los metadatos
-            )
-            
-            # Obtenemos la memoria existente para no duplicar el último mensaje
-            memory = await zep_client.memory.get_memory(session_id)
-            if not memory or not any(m.content == user_input for m in memory.messages):
-                 await zep_client.memory.add_memory(
-                    session_id,
-                    messages=[user_message_to_save, ai_message_to_save]
-                )
-            else:
-                 await zep_client.memory.add_memory(
-                    session_id,
-                    messages=[ai_message_to_save]
-                )
-
-            print(f"Historial de mensajes guardado en Zep para la sesión: {session_id}")
-        except Exception as e:
-            print(f"Error al guardar mensajes en Zep para la sesión {session_id}: {e}")
         
-        # 6. Devolver la respuesta al Gateway
+        # 4.1. Añadir el mensaje de la IA a Zep
+        ai_message = Message(role="assistant", content=ai_response_content)
+        await add_messages_to_zep(session_id, [ai_message])
+        print(f"✅ Mensaje de la IA añadido a Zep para el thread: {session_id}")
+
+        # 5. Devolver la respuesta final
         return {"response": ai_response_content}
-        
+
     except Exception as e:
         print(f"❌ Error crítico en endpoint /invoke para sesión {session_id}: {e}")
+        # Loguear el traceback completo para depuración
+        import traceback
+        traceback.print_exc()
         return {"status": "error", "message": "Internal server error. Please try again."}
 
 if __name__ == "__main__":

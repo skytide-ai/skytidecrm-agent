@@ -4,10 +4,12 @@ const axios = require('axios');
 const { resolveOrganization, resolveChatIdentity } = require('../middlewares/auth');
 const { createClient } = require('@supabase/supabase-js');
 const { processMedia } = require('../utils/mediaProcessor');
+const { sendTextMessage } = require('../utils/gupshupApi');
 
+// Cliente con service key para operaciones de webhook (insert privilegiadas)
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 // POST /webhooks/gupshup
@@ -17,7 +19,31 @@ const supabase = createClient(
 // 4. Se guarda el mensaje entrante
 // 5. Se ejecuta la lógica de la ruta para hacer el proxy
 // 6. Se guarda el mensaje saliente
-router.post('/gupshup', resolveOrganization, resolveChatIdentity, async (req, res) => {
+router.post('/gupshup', (req, res, next) => {
+  // 🔍 DEBUG: Log completo del payload de Gupshup para analizar la estructura
+  console.log('🔍 GUPSHUP PAYLOAD:', JSON.stringify(req.body, null, 2));
+  
+  // 🔧 MANEJAR EVENTOS DE CONFIGURACIÓN/VERIFICACIÓN DE GUPSHUP
+  if (req.body.type === 'user-event' && req.body.payload?.type === 'sandbox-start') {
+    console.log('✅ Gupshup webhook configuration event - responding with 200');
+    return res.status(200).json({ 
+      status: 'success', 
+      message: 'Webhook configured successfully' 
+    });
+  }
+  
+  // Para otros tipos de eventos que no son mensajes, también responder 200
+  if (req.body.type !== 'message') {
+    console.log(`✅ Gupshup non-message event (${req.body.type}) - responding with 200`);
+    return res.status(200).json({ 
+      status: 'success', 
+      message: `Event ${req.body.type} received` 
+    });
+  }
+  
+  // Si es un mensaje real, continuar con el procesamiento normal
+  next();
+}, resolveOrganization, resolveChatIdentity, async (req, res) => {
   try {
     // Los middlewares ya resolvieron todo lo necesario:
     // req.organizationId, req.chatIdentityId, req.contactId, req.phone, req.countryCode, req.phoneNumber
@@ -123,45 +149,57 @@ router.post('/gupshup', resolveOrganization, resolveChatIdentity, async (req, re
     console.log('Received response from Python service:');
     console.log(JSON.stringify(responseFromPython.data, null, 2));
 
-    // 5. GUARDAR MENSAJE SALIENTE 
+    // 5. EXTRAER RESPUESTA DEL AGENTE
     const aiResponse = responseFromPython.data?.response || responseFromPython.data?.message || 'Sin respuesta';
     
-                const { data: outgoingMessage, error: outgoingMessageError } = await supabase
-              .from('chat_messages')
-              .insert({
-                chat_identity_id: req.chatIdentityId,
-                direction: 'outgoing',
-                message: aiResponse,
-                message_status: 'pending',  // ⭐ Webhook usa pending (CRM usa default 'sent')
-                received_via: 'whatsapp',
-                organization_id: req.organizationId
-              })
-              .select('id')
-              .single();
+    // 6. ENVIAR RESPUESTA A WHATSAPP VIA GUPSHUP
+    console.log('🚀 Enviando respuesta a WhatsApp via Gupshup...');
+    const gupshupResult = await sendTextMessage(
+      req.gupshupApiKey,
+      req.whatsappBusinessNumber,
+      req.phone, // Número del usuario que envió el mensaje
+      aiResponse
+    );
+
+    let messageStatus = 'pending';
+    if (gupshupResult.success) {
+      messageStatus = 'sent';
+      console.log(`✅ Mensaje enviado a WhatsApp. MessageId: ${gupshupResult.messageId}`);
+    } else {
+      console.error('❌ Error enviando mensaje a WhatsApp:', gupshupResult.error);
+      messageStatus = 'failed';
+    }
+    
+    // 7. GUARDAR MENSAJE SALIENTE CON ESTADO CORRECTO
+    const { data: outgoingMessage, error: outgoingMessageError } = await supabase
+      .from('chat_messages')
+      .insert({
+        chat_identity_id: req.chatIdentityId,
+        direction: 'outgoing',
+        message: aiResponse,
+        message_status: messageStatus, // 'sent', 'failed', o 'pending'
+        received_via: 'whatsapp',
+        organization_id: req.organizationId,
+        // Agregar messageId de Gupshup si está disponible
+        ...(gupshupResult.success && { external_message_id: gupshupResult.messageId })
+      })
+      .select('id')
+      .single();
 
     if (outgoingMessageError) {
       console.error('Error saving outgoing message:', outgoingMessageError);
       // No fallar la request por esto, solo loguearlo
     } else {
-      console.log('✅ Outgoing message saved to chat_messages with pending status');
-      
-      // ⭐ Si el Python service respondió exitosamente, actualizar estado a 'sent'
-      if (responseFromPython.status === 200 && outgoingMessage?.id) {
-        const { error: updateError } = await supabase
-          .from('chat_messages')
-          .update({ message_status: 'sent' })
-          .eq('id', outgoingMessage.id);
-        
-        if (updateError) {
-          console.error('Error updating message status to sent:', updateError);
-        } else {
-          console.log('✅ Message status updated to sent');
-        }
-      }
+      console.log(`✅ Outgoing message saved with status: ${messageStatus}`);
     }
 
-    // 6. REENVIAR LA RESPUESTA AL CLIENTE ORIGINAL (Gupshup)
-    res.status(responseFromPython.status).json(responseFromPython.data);
+    // 8. RESPONDER A GUPSHUP
+    // Gupshup espera una respuesta HTTP 200 para confirmar que recibimos el webhook
+    res.status(200).json({ 
+      status: 'processed', 
+      message: 'Message processed and response sent',
+      gupshupMessageId: gupshupResult.success ? gupshupResult.messageId : null
+    });
 
   } catch (error) {
     console.error('Error in webhook processing:', error.message);

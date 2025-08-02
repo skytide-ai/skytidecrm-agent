@@ -19,7 +19,7 @@ async def handle_human_escalation(organization_id: str, chat_identity_id: str, r
     try:
         # 1. Obtener información del chat_identity (siempre existe)
         print("Obteniendo información del chat_identity...")
-        chat_response = await supabase_client.table('chat_identities').select(
+        chat_response = supabase_client.table('chat_identities').select(
             'platform_user_id, contact_id'
         ).eq('id', chat_identity_id).single().execute()
         
@@ -37,7 +37,7 @@ async def handle_human_escalation(organization_id: str, chat_identity_id: str, r
         
         if contact_id_from_chat:
             print(f"Buscando nombre del contacto con ID: {contact_id_from_chat}")
-            contact_response = await supabase_client.table('contacts').select(
+            contact_response = supabase_client.table('contacts').select(
                 'first_name, last_name'
             ).eq('id', contact_id_from_chat).eq('organization_id', organization_id).maybe_single().execute()
             
@@ -55,7 +55,7 @@ async def handle_human_escalation(organization_id: str, chat_identity_id: str, r
         
         # 2. Obtener configuración de notificaciones de escalación
         print("Obteniendo configuración de notificaciones...")
-        notification_response = await supabase_client.table('internal_notifications_config').select(
+        notification_response = supabase_client.table('internal_notifications_config').select(
             'recipient_phone, country_code'
         ).eq('organization_id', organization_id).eq('is_active', True).maybe_single().execute()
         
@@ -101,7 +101,7 @@ async def handle_human_escalation(organization_id: str, chat_identity_id: str, r
         # 4. Desactivar el bot SOLO SI la notificación fue exitosa
         if notification_sent_successfully:
             print("Desactivando bot para este chat...")
-            await supabase_client.table('chat_identities').update({
+            supabase_client.table('chat_identities').update({
                 'bot_enabled': False,
                 'requires_human_intervention': True
             }).eq('id', chat_identity_id).execute()

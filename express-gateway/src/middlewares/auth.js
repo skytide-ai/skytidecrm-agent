@@ -3,13 +3,18 @@ const { createClient } = require('@supabase/supabase-js');
 // Configuración de Supabase
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!supabaseUrl || !supabaseAnonKey) {
-    console.error('❌ Error: SUPABASE_URL y SUPABASE_ANON_KEY deben estar configuradas en las variables de entorno');
+if (!supabaseUrl || !supabaseAnonKey || !supabaseServiceKey) {
+    console.error('❌ Error: SUPABASE_URL, SUPABASE_ANON_KEY y SUPABASE_SERVICE_ROLE_KEY deben estar configuradas en las variables de entorno');
     process.exit(1);
 }
 
+// Cliente con anon key para consultas de lectura básicas
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+// Cliente con service key para operaciones de webhook (insert/update privilegiadas)
+const supabaseService = createClient(supabaseUrl, supabaseServiceKey);
 
 const resolveOrganization = async (req, res, next) => {
     try {
@@ -23,10 +28,10 @@ const resolveOrganization = async (req, res, next) => {
 
         console.log(`Buscando organización para app: ${appName}`);
 
-        // Consultar la tabla platform_connections en Supabase
+        // Consultar la tabla platform_connections en Supabase incluyendo credenciales de Gupshup
         const { data: connection, error } = await supabase
             .from('platform_connections')
-            .select('organization_id, is_active')
+            .select('organization_id, is_active, gupshup_api_key, gupshup_app_name, whatsapp_business_number')
             .eq('gupshup_app_name', appName)
             .eq('is_active', true)
             .eq('platform', 'whatsapp')
@@ -56,9 +61,22 @@ const resolveOrganization = async (req, res, next) => {
             });
         }
 
-        // Añadimos el organization_id al objeto request para uso posterior
+        // Añadimos el organization_id y las credenciales de Gupshup al objeto request para uso posterior
         req.organizationId = connection.organization_id;
+        req.gupshupApiKey = connection.gupshup_api_key;
+        req.gupshupAppName = connection.gupshup_app_name;
+        req.whatsappBusinessNumber = connection.whatsapp_business_number;
+        
         console.log(`✅ Request resolved to organizationId: ${req.organizationId} for app: ${appName}`);
+        console.log(`✅ Gupshup credentials loaded for organization`);
+
+        // Validar que tenemos las credenciales necesarias
+        if (!req.gupshupApiKey || !req.whatsappBusinessNumber) {
+            console.error('Gupshup credentials incomplete for organization:', req.organizationId);
+            return res.status(500).json({ 
+                error: 'Gupshup configuration incomplete for this organization' 
+            });
+        }
 
         // Pasamos el control al siguiente middleware o a la ruta
         next();
@@ -92,8 +110,8 @@ const resolveChatIdentity = async (req, res, next) => {
 
     console.log(`Resolving chat identity for organization: ${req.organizationId}, phone: ${phone}`);
 
-    // 1. Buscar chat_identity existente
-    const { data: existingChatIdentity, error: searchError } = await supabase
+    // 1. Buscar chat_identity existente (lectura con service key para evitar RLS)
+    const { data: existingChatIdentity, error: searchError } = await supabaseService
       .from('chat_identities')
       .select('id, contact_id')
       .eq('organization_id', req.organizationId)
@@ -115,16 +133,16 @@ const resolveChatIdentity = async (req, res, next) => {
       contactId = existingChatIdentity.contact_id;
       console.log(`Existing chat identity found: ${chatIdentityId}, contact_id: ${contactId}`);
       
-      // Actualizar last_seen
-      await supabase
+      // Actualizar last_seen (escritura con service key)
+      await supabaseService
         .from('chat_identities')
         .update({ last_seen: new Date().toISOString() })
         .eq('id', chatIdentityId);
         
     } else {
-      // Crear nueva chat_identity
+      // Crear nueva chat_identity (escritura con service key)
       console.log('Creating new chat identity...');
-      const { data: newChatIdentity, error: insertError } = await supabase
+      const { data: newChatIdentity, error: insertError } = await supabaseService
         .from('chat_identities')
         .insert({
           organization_id: req.organizationId,

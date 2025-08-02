@@ -1,24 +1,17 @@
 from typing import Dict, Any, List, Optional
 import datetime
-import os
 from pydantic import BaseModel, Field
 import pydantic_ai
 from openai import OpenAI
 from pydantic_ai import Agent, RunContext
 
-# Importamos el estado global y el cliente de Supabase
+# Importamos el estado global, el cliente de Supabase y funciones de Zep
 from ..state import GlobalState
 from ..db import supabase_client
+from ..zep import get_zep_memory_context
 
-# --- Cliente Pydantic AI con OpenRouter ---
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-    default_headers={
-        "HTTP-Referer": "https://skytidecrm.com",
-        "X-Title": "SkytideCRM Agent",
-    }
-)
+# --- Cliente Pydantic AI ---
+client = OpenAI()
 
 # --- Modelos de Datos para Herramientas ---
 class AvailabilitySlot(BaseModel):
@@ -37,8 +30,9 @@ class AppointmentInfo(BaseModel):
     summary: str
 
 # --- Definición del Agente de Citas ---
-appointment_agent = Agent(
-    client,  # Usamos el cliente configurado para OpenRouter
+appointment_agent = Agent[GlobalState](
+    'openai:gpt-4o',
+    deps_type=GlobalState,
     system_prompt="""
     Eres un asistente experto en la gestión de citas. Tu trabajo es guiar al usuario a través del proceso de agendamiento, consulta, cancelación y reprogramación.
 
@@ -49,7 +43,7 @@ appointment_agent = Agent(
 
     **Flujos Específicos:**
     -   **Agendar Cita (`book_appointment`):**
-        -   **Paso 1: Contacto.** Llama a `resolve_contact_on_booking` para obtener el `contact_id`. Si el usuario es nuevo, pide su nombre y apellido.
+        -   **Paso 1: Contacto.** ANTES de pedir datos, revisa el historial/contexto para ver si ya conoces al usuario. Si ya tienes su nombre en conversaciones anteriores, úsalo directamente. Si es un usuario completamente nuevo, entonces pide su nombre y apellido. Luego llama a `resolve_contact_on_booking`.
         -   **Paso 2: Disponibilidad.** Llama a `check_availability` para encontrar horarios. Siempre muestra al menos 3 opciones al usuario.
         -   **Paso 3: Agendamiento.** Una vez que el usuario elige una hora, llama a `book_appointment`.
         -   **Paso 4: Notificaciones (MUY IMPORTANTE).** Después de un agendamiento exitoso, la herramienta `book_appointment` te devolverá un campo `opt_in_status`.
@@ -70,7 +64,8 @@ appointment_agent = Agent(
     **Reglas Importantes:**
     -   Sé siempre amable y conversacional.
     -   No inventes información. Si no puedes hacer algo, informa al usuario.
-    -   Utiliza la información del historial de la conversación para no volver a preguntar datos que ya tienes.
+    -   **MEMORIA:** Utiliza la información del historial de la conversación para no volver a preguntar datos que ya tienes. Si en el historial ya tienes el nombre del usuario, úsalo directamente. Si ya agendó antes, no pidas datos personales de nuevo.
+    -   **CONTACTOS EXISTENTES:** Cuando `resolve_contact_on_booking` retorne `is_existing_contact: true`, significa que el usuario ya tiene historial. No pidas nombre/apellido nuevamente.
     """,
 )
 
@@ -78,6 +73,7 @@ appointment_agent = Agent(
 
 @appointment_agent.tool
 async def resolve_contact_on_booking(
+    ctx: RunContext[GlobalState],
     organization_id: str,
     phone_number: str,
     country_code: str,
@@ -87,6 +83,9 @@ async def resolve_contact_on_booking(
     """
     Busca un contacto por número de teléfono o lo crea si no existe.
     Esencial para vincular la cita a un contacto.
+    
+    IMPORTANTE: Si el contacto ya existe, NO necesitas pedir nombre/apellido.
+    Solo pide datos si es un usuario completamente nuevo.
     """
     print(f"Resolviendo contacto para la organización {organization_id} y el teléfono {country_code}{phone_number}...")
 
@@ -100,7 +99,8 @@ async def resolve_contact_on_booking(
             return {
                 "success": True,
                 "contact_id": contact_id,
-                "message": "Contacto existente encontrado.",
+                "message": "Contacto existente encontrado. No necesitas pedir más datos.",
+                "is_existing_contact": True
             }
         else:
             # 2. Si no existe, crear el nuevo contacto
@@ -121,10 +121,19 @@ async def resolve_contact_on_booking(
             if insert_response.data:
                 new_contact_id = insert_response.data['id']
                 print(f"Nuevo contacto creado con éxito: contact_id='{new_contact_id}'")
+                
+                # IMPORTANTE: Actualizar el usuario de Zep con los datos reales
+                state = ctx.deps
+                if state.get("chat_identity_id") and first_name and last_name:
+                    from ..zep import update_zep_user_with_real_data
+                    user_id = f"chat_{state['chat_identity_id']}"
+                    await update_zep_user_with_real_data(user_id, first_name, last_name)
+                
                 return {
                     "success": True,
                     "contact_id": new_contact_id,
                     "message": "Nuevo contacto creado con éxito.",
+                    "is_existing_contact": False
                 }
             else:
                 raise Exception("Error al insertar el nuevo contacto en la base de datos.")
@@ -140,6 +149,7 @@ async def resolve_contact_on_booking(
 
 @appointment_agent.tool
 async def check_availability(
+    ctx: RunContext[GlobalState],
     service_id: str, 
     organization_id: str,
     date: str  # Formato 'YYYY-MM-DD'
@@ -210,6 +220,7 @@ async def check_availability(
 
 @appointment_agent.tool
 async def book_appointment(
+    ctx: RunContext[GlobalState],
     contact_id: str,
     service_id: str,
     member_id: str,
@@ -273,7 +284,7 @@ async def book_appointment(
         )
 
 @appointment_agent.tool
-async def create_whatsapp_opt_in(contact_id: str, organization_id: str) -> Dict[str, Any]:
+async def create_whatsapp_opt_in(ctx: RunContext[GlobalState], contact_id: str, organization_id: str) -> Dict[str, Any]:
     """
     Crea un registro de autorización (opt-in) para que un contacto reciba notificaciones de WhatsApp.
     """
@@ -302,6 +313,7 @@ async def create_whatsapp_opt_in(contact_id: str, organization_id: str) -> Dict[
 
 @appointment_agent.tool
 async def get_user_appointments(
+    ctx: RunContext[GlobalState],
     contact_id: str,
     date: Optional[str] = None,
     time: Optional[str] = None
@@ -323,7 +335,7 @@ async def get_user_appointments(
         response = await query.order('appointment_date').order('start_time').execute()
         if not response.data:
             return []
-            
+
         return [AppointmentInfo(
             appointment_id=appt['id'],
             summary=f"Cita para '{appt['services']['name'] if appt.get('services') else ''}' con {appt['profiles']['first_name'] if appt.get('profiles') else ''} el {appt['appointment_date']} a las {appt['start_time']}"
@@ -333,7 +345,7 @@ async def get_user_appointments(
         return []
 
 @appointment_agent.tool
-async def cancel_appointment(appointment_id: str) -> AppointmentConfirmation:
+async def cancel_appointment(ctx: RunContext[GlobalState], appointment_id: str) -> AppointmentConfirmation:
     """
     Cancela una cita actualizando su estado a 'cancelled'.
     """
@@ -355,8 +367,19 @@ async def cancel_appointment(appointment_id: str) -> AppointmentConfirmation:
 async def run_appointment_agent(state: GlobalState) -> Dict[str, Any]:
     """
     Punto de entrada para ejecutar el agente de citas.
+    Ahora incluye contexto de memoria de Zep.
     """
     print("--- Ejecutando Appointment Agent ---")
+    
+    # Obtener contexto de memoria de Zep si hay chat_identity_id
+    zep_context = ""
+    if state.get("chat_identity_id"):
+        thread_id = state['chat_identity_id']
+        try:
+            zep_context = await get_zep_memory_context(thread_id, min_rating=0.0)
+        except Exception as e:
+            print(f"❌ Error obteniendo contexto de Zep thread {thread_id}: {e}")
+            zep_context = ""
     
     # Preparamos el contexto para el agente, incluyendo el historial y datos clave del estado.
     # Esto es crucial para que el LLM tenga toda la información necesaria.
@@ -373,12 +396,14 @@ async def run_appointment_agent(state: GlobalState) -> Dict[str, Any]:
     - Cita en Foco (si aplica): {state.get('focused_appointment')}
     - Horarios Ofrecidos (si aplica): {state.get('available_slots')}
     
+    {"Contexto de Memoria Zep: " + zep_context if zep_context else ""}
+    
     Último Mensaje del Usuario: "{state['messages'][-1].content}"
 
     Por favor, actúa según tu flujo de trabajo y el último mensaje del usuario.
     """
 
-    result = await appointment_agent.run(input_prompt, client=client)
+    result = await appointment_agent.run(input_prompt)
     
     tool_output = result.output
 
@@ -398,8 +423,8 @@ async def run_appointment_agent(state: GlobalState) -> Dict[str, Any]:
     if isinstance(tool_output, AppointmentConfirmation):
         return {
             "messages": [("ai", tool_output.message)],
-            "focused_appointment": None,
-            "available_slots": None,
+                "focused_appointment": None,
+                "available_slots": None,
         }
 
     if isinstance(tool_output, list) and all(isinstance(i, AppointmentInfo) for i in tool_output):

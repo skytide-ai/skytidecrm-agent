@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 langgraph
-zep-python
+zep-cloud
 python-dotenv
 pydantic-ai
 openai
