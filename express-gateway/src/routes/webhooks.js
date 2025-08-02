@@ -41,6 +41,13 @@ router.post('/gupshup', (req, res, next) => {
     });
   }
   
+  // 🔧 ANTI-LOOP: Ignorar webhooks que son ecos de nuestros propios mensajes
+  // Comparamos el `source` (quién envía) con el número de negocio de WhatsApp
+  if (req.body?.payload?.source === req.whatsappBusinessNumber) {
+    console.log('✅ Ignorando eco de mensaje propio del bot.');
+    return res.status(200).json({ status: 'success', message: 'Bot message echo ignored' });
+  }
+
   // Si es un mensaje real, continuar con el procesamiento normal
   next();
 }, resolveOrganization, resolveChatIdentity, async (req, res) => {
@@ -181,7 +188,7 @@ router.post('/gupshup', (req, res, next) => {
         received_via: 'whatsapp',
         organization_id: req.organizationId,
         // Agregar messageId de Gupshup si está disponible
-        ...(gupshupResult.success && { external_message_id: gupshupResult.messageId })
+        ...(gupshupResult.success && { platform_message_id: gupshupResult.messageId })
       })
       .select('id')
       .single();

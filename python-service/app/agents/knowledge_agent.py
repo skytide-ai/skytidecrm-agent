@@ -52,12 +52,13 @@ async def search_knowledge_semantic(query: str, organization_id: str, limit: int
         
         # Buscar en knowledge_base usando similarity search
         # Usamos la función match_documents de Supabase que maneja embeddings
-        result = supabase_client.rpc(
+        # AÑADIMOS EL FILTRO POR ORGANIZATION_ID AQUÍ
+        result = await supabase_client.rpc(
             'match_documents',
             {
                 'query_embedding': query_embedding,
                 'match_count': limit,
-                'filter': {'organization_id': organization_id}
+                'p_organization_id': organization_id
             }
         ).execute()
         
@@ -200,13 +201,20 @@ knowledge_agent = Agent[GlobalState](
     
     SERVICIOS:
     - "Quiero algo para rejuvenecer" → Busca servicios
-    - "¿Cuánto cuesta el hidrofacial?" → Busca servicio específico
+    - "¿Cuánto cuesta [nombre del servicio]?" → Busca servicio específico
     
     HISTORIAL DEL USUARIO:
     - "¿Qué servicios me recomendaste antes?" → search_user_conversations
     - "¿Cuáles fueron mis servicios favoritos?" → search_user_facts
     - "¿Tuve algún problema?" → search_user_facts
     - "¿He venido antes por problemas de acné?"
+    
+    🚨 REGLAS CRÍTICAS:
+    - NUNCA INVENTES información que no encuentres en las herramientas
+    - NO menciones servicios específicos a menos que la herramienta los devuelva explícitamente
+    - Si no encuentras información específica, pide clarificación o ofrece escalación
+    - SOLO usa datos reales retornados por las herramientas de búsqueda
+    - NO hagas suposiciones sobre qué servicios podrían existir
     
     IMPORTANTE: No respondas directamente al usuario, solo ejecuta las herramientas necesarias y devuelve sus resultados estructurados.
     """
@@ -246,6 +254,12 @@ async def knowledge_search(ctx: RunContext[GlobalState], query: str) -> Knowledg
         
         print(f"✅ Información encontrada: source_type={source_type}, similarity={similarity:.2f}")
         print(f"📄 Content preview: {content[:100]}...")
+        
+        # 🎯 UMBRAL DE SIMILARITY: Si la similarity es muy baja, no es información útil
+        if similarity < 0.3:  # Ajustar este valor según necesidades
+            return KnowledgeSearchResult(
+                clarification_message=f"No encontré información específica sobre '{query}'. ¿Podrías ser más específico sobre qué tipo de información necesitas? Por ejemplo: servicios, precios, ubicación, horarios, etc. Si prefieres, también puedo ayudarte a contactar con un asesor."
+            )
         
         if source_type == 'file':
             # Es información general (ubicación, horarios, etc.)

@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from langgraph.types import Command
 from langgraph.graph import END
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, trim_messages
 
 # Importamos el estado global y funciones de Zep
 from .state import GlobalState
@@ -30,113 +30,92 @@ class SupervisorOutput(BaseModel):
     )
 
 # 3. Creamos la función del nodo supervisor que se usará en el grafo
-async def supervisor_node(state: GlobalState) -> Union[Command[Literal[*AGENT_NAMES, "__end__"]], dict]:
+async def supervisor_node(state: GlobalState) -> Command[Literal[*AGENT_NAMES, "__end__"]]:
     """
-    Este es el nodo que orquesta el flujo de trabajo usando el patrón Command moderno.
-    Llama al supervisor para decidir el siguiente paso usando pydantic-ai.
-    Ahora incluye contexto de memoria de Zep.
+    Este nodo orquesta el flujo de trabajo. Analiza el mensaje más reciente del usuario
+    y decide qué hacer a continuación, utilizando el historial como contexto.
     """
     print("--- Supervisor ---")
+
+    # --- 1. Extraer el último mensaje del usuario ---
+    latest_user_message = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
+
+    if not latest_user_message:
+        print("⚠️ No se encontró un mensaje de usuario para procesar. Terminando.")
+        return Command(goto="__end__")
+
+    # --- 2. Preparar el contexto para el LLM ---
+    history_messages = state["messages"][:-1]
+    history_str = "\n".join([f"{msg.__class__.__name__}: {msg.content}" for msg in history_messages])
     
-    # Crear string de mensajes compatible con LangChain Messages
-    messages_str = "\n".join([f"{msg.__class__.__name__}: {msg.content}" for msg in state["messages"]])
-    
-    # Obtener contexto de memoria de Zep si hay chat_identity_id
     zep_context = ""
     if state.get("chat_identity_id"):
-        # Usamos chat_identity_id directamente como thread_id para consistencia
         thread_id = state['chat_identity_id']
         try:
             zep_context = await get_zep_memory_context(thread_id)
             if zep_context:
-                 print(f"🧠 Contexto Zep para thread {thread_id} encontrado.")
+                print(f"🧠 Contexto Zep para thread {thread_id} encontrado.")
         except Exception as e:
-            # Es normal que al principio no haya contexto, no es un error crítico.
-            print(f"⚠️ No se pudo obtener contexto de Zep para thread {thread_id} (puede ser nuevo). Error: {e}")
-            zep_context = ""
+            print(f"⚠️ No se pudo obtener contexto de Zep para thread {thread_id}. Error: {e}")
+
+    # --- 3. Construir el Prompt para el Supervisor ---
+    system_prompt = f\"\"\"
+    Eres un asistente virtual experto en un centro de belleza. Tu única función es analizar el MENSAJE MÁS RECIENTE del usuario y decidir el siguiente paso.
+
+    **Contexto de la Conversación (Mensajes Anteriores):**
+    {history_str}
+
+    **Memoria a Largo Plazo (Datos del Cliente):**
+    {zep_context}
+
+    **INSTRUCCIONES CRÍTICAS:**
+    1.  Tu foco principal es el **"MENSAJE DEL USUARIO A PROCESAR"**.
+    2.  Usa el contexto y la memoria SÓLO para entender la intención del mensaje actual.
+    3.  **NO respondas a mensajes antiguos.** Tu tarea es actuar sobre el último input.
+    4.  Sé decisivo y claro en tu enrutamiento.
+
+    **Reglas de Enrutamiento:**
+    -   Para saludos, despedidas o charla casual: responde directamente y termina (`terminate`).
+    -   Para consultas **VAGAS** (ej: "info", "ayuda"): responde pidiendo más detalles y termina (`terminate`).
+    -   Para preguntas **ESPECÍFICAS** sobre servicios, precios, ubicación, horarios: enruta a `KnowledgeAgent`.
+    -   Si un usuario quiere **agendar** una cita: enruta a `AppointmentAgent`.
+    -   Si el usuario pide explícitamente hablar con un **humano/asesor**: enruta a `EscalationAgent`.
+    -   Si el mensaje del usuario es una simple confirmación (ej: "ok", "listo") y la tarea anterior ya se completó: responde amablemente y termina (`terminate`).
+    \"\"\"
     
-    # Construir el system prompt enriquecido con contexto de Zep
-    base_system_prompt = """
-    Eres un asistente virtual amigable y profesional para un centro de belleza.
-    
-    Tu función principal es mantener una conversación natural y decidir cuándo es necesario usar agentes especializados.
-    
-    PUEDES RESPONDER DIRECTAMENTE A:
-    - Saludos: "Hola", "Buenos días", "¿Cómo estás?"
-    - Despedidas: "Adiós", "Gracias", "Hasta luego"
-    - Agradecimientos: "Gracias", "Te agradezco"
-    - Conversación general y cortesía
-    
-    USA AGENTES ESPECIALIZADOS PARA:
-    - KnowledgeAgent: Preguntas específicas sobre servicios, precios, ubicación, horarios, contacto, o cuando quieren agendar.
-    - AppointmentAgent: Una vez que KnowledgeAgent haya identificado un service_id y el usuario quiera agendar.
-    - EscalationAgent: SOLO cuando pidan EXPLÍCITAMENTE hablar con un humano/asesor.
-    
-    INSTRUCCIONES:
-    - Para saludos simples → responde directamente con naturalidad y pregunta cómo puedes ayudar → 'terminate'
-    - Para preguntas específicas sobre servicios/info → 'KnowledgeAgent'
-    - Para escalación explícita → 'EscalationAgent'
-    - Si ya respondiste o un agente completó su tarea → 'terminate'
-    
-    Sé cálido, profesional y conversacional. Actúa como un verdadero asistente humano.
-    """
-    
-    enhanced_system_prompt = base_system_prompt
-    if zep_context:
-        enhanced_system_prompt += f"\n\n--- CONTEXTO DE MEMORIA ZEP ---\n{zep_context}\n--- FIN CONTEXTO ---"
-    
-    # Construir el input para el agente
-    messages_content = f"""
-    Estado actual:
-    - service_id: {state.get('service_id')}
-    - contact_id: {state.get('contact_id')}
-    - organization_id: {state.get('organization_id')}
-    
-    Conversación:
-    {messages_str}
-    """
-    
-    # 🔍 DEBUG: Log completo del input al supervisor
-    print(f"🔍 DEBUG - System prompt:")
-    print(enhanced_system_prompt[:500] + "..." if len(enhanced_system_prompt) > 500 else enhanced_system_prompt)
-    print(f"🔍 DEBUG - Messages content:")
-    print(messages_content)
-    print(f"🔍 DEBUG - Zep context length: {len(zep_context) if zep_context else 0}")
-    
-    # Crear el agente supervisor inline
+    user_input_for_llm = f\"\"\"
+    **MENSAJE DEL USUARIO A PROCESAR:**
+    "{latest_user_message.content}"
+    \"\"\"
+
+    # --- 4. Invocar el LLM (Supervisor) ---
     supervisor_agent = Agent[GlobalState](
         'openai:gpt-4o',
         deps_type=GlobalState,
         result_type=SupervisorOutput,
-        system_prompt=enhanced_system_prompt
+        system_prompt=system_prompt
     )
     
-    # Ejecutar el agente - Pydantic AI usa el client internamente
-    result = await supervisor_agent.run(messages_content, deps=state)
+    print(f"🔍 Invocando supervisor para el mensaje: '{latest_user_message.content}'")
+    result = await supervisor_agent.run(user_input_for_llm, deps=state)
     next_agent_value = result.data.next_agent
     direct_response = result.data.direct_response
     
-    print(f"Supervisor (con contexto Zep) ha decidido enrutar a: {next_agent_value}")
-    
-    # SOLO generar respuesta directa si es terminate Y hay direct_response
-    if next_agent_value == TERMINATE and direct_response:
-        print(f"📝 Supervisor respuesta directa: {direct_response[:100]}...")
+    print(f"✅ Supervisor decidió enrutar a: {next_agent_value}")
+
+    # --- 5. Retornar el Comando ---
+    if direct_response:
+        print(f"📝 Supervisor generando respuesta directa: '{direct_response[:100]}...'")
+        ai_message = AIMessage(content=direct_response, name="Supervisor")
         
-        # Si hay respuesta directa Y es terminate, agregar el mensaje AI al estado y terminar
+        # Obtenemos los mensajes actuales para añadir el nuevo
         current_messages = state.get("messages", [])
-        ai_message = AIMessage(content=direct_response)
-        current_messages.append(ai_message)
         
-        # Retornar estado actualizado con TERMINATE para terminar
-        return {
-            "messages": current_messages,
-            "next_agent": TERMINATE
-        }
-    elif next_agent_value in ["KnowledgeAgent", "AppointmentAgent", "EscalationAgent"]:
-        # Si enruta a un agente específico, usar Command
-        print(f"🔀 Enrutando al agente: {next_agent_value}")
-        return Command(goto=next_agent_value)
-    else:
-        # Si es terminate pero sin respuesta directa, solo terminar
-        print(f"🏁 Terminando sin respuesta directa")
-        return Command(goto=END) 
+        return Command(
+            update={"messages": current_messages + [ai_message]},
+            goto="__end__"
+        )
+    
+    # Si no hay respuesta directa, simplemente enruta al siguiente agente.
+    # El agente se encargará de añadir su propia respuesta al estado.
+    return Command(goto=next_agent_value) 
