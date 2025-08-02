@@ -23,11 +23,16 @@ from .zep import (
     update_zep_user_with_real_data
 )
 
-# --- 1. Definición del Grafo de LangGraph ---
+# --- 1. Funciones auxiliares del grafo ---
+
+# Función eliminada - ya no necesaria con el patrón Command
+
+# --- 2. Definición del Grafo de LangGraph ---
 # El grafo se define igual, pero se compila sin checkpointer
 
 workflow = StateGraph(GlobalState)
 
+# Con el patrón Command moderno, el supervisor maneja el routing automáticamente
 workflow.add_node("KnowledgeAgent", run_knowledge_agent)
 workflow.add_node("AppointmentAgent", run_appointment_agent)
 workflow.add_node("EscalationAgent", run_escalation_agent)
@@ -35,39 +40,31 @@ workflow.add_node("Supervisor", supervisor_node)
 
 workflow.set_entry_point("Supervisor")
 
+# Edges de regreso de agentes al supervisor
 workflow.add_edge("KnowledgeAgent", "Supervisor")
-workflow.add_edge("AppointmentAgent", "Supervisor")
+workflow.add_edge("AppointmentAgent", "Supervisor") 
 workflow.add_edge("EscalationAgent", "Supervisor")
 
-def route_next(state: GlobalState):
+# Función de routing para manejar respuestas directas
+def route_supervisor(state: GlobalState):
+    """Routing function para manejar respuestas directas del supervisor"""
     next_agent = state.get("next_agent")
+    print(f"🔄 Routing supervisor - next_agent: {next_agent}")
     
-    # Si hay una respuesta directa del supervisor, crear el mensaje AI y terminar
-    if state.get("direct_response"):
-        direct_response = state["direct_response"]
-        print(f"🎯 Procesando respuesta directa del Supervisor: {direct_response[:100]}...")
-        
-        # Agregar el mensaje AI directamente al estado
-        ai_message = AIMessage(content=direct_response)
-        current_messages = state.get("messages", [])
-        current_messages.append(ai_message)
-        state["messages"] = current_messages
-        
+    if next_agent == TERMINATE:
+        print("🏁 Supervisor terminando con respuesta directa")
         return END
-    
-    if next_agent == TERMINATE or not next_agent:
+    else:
+        print(f"🏁 Estado desconocido en routing, terminando: {next_agent}")
         return END
-    return next_agent
 
+# Agregar conditional edges para el supervisor
 workflow.add_conditional_edges(
     "Supervisor",
-    route_next,
+    route_supervisor,
     {
-        "KnowledgeAgent": "KnowledgeAgent",
-        "AppointmentAgent": "AppointmentAgent",
-        "EscalationAgent": "EscalationAgent",
         TERMINATE: END,
-        END: END  # Mapeo directo para cuando route_next devuelve END
+        END: END
     }
 )
 
@@ -208,10 +205,29 @@ async def invoke(payload: InvokePayload):
 
         # 4. Extraer y guardar la respuesta de la IA
         ai_response_content = "No he podido procesar tu solicitud. Por favor, intenta de nuevo."
+        
+        # DEBUG: Información completa del estado final
+        print(f"🔍 DEBUGGING - Estado final:")
+        print(f"🔍 Tipo: {type(final_state_result)}")
+        print(f"🔍 Claves disponibles: {list(final_state_result.keys()) if hasattr(final_state_result, 'keys') else 'No tiene keys'}")
+        
+        # Buscar el último mensaje AI en el estado final
         if final_state_result.get("messages"):
-            last_message = final_state_result["messages"][-1]
+            messages = final_state_result["messages"]
+            print(f"🔍 Total mensajes encontrados: {len(messages)}")
+            for i, msg in enumerate(messages):
+                print(f"🔍 Mensaje {i}: {type(msg).__name__} - {msg.content[:50]}...")
+            
+            last_message = messages[-1]
             if isinstance(last_message, AIMessage):
                 ai_response_content = last_message.content
+                print(f"✅ Usando último mensaje AI: {ai_response_content[:100]}...")
+            else:
+                print(f"⚠️ Último mensaje no es AIMessage: {type(last_message)}")
+                print(f"🔍 Contenido del último mensaje: {last_message}")
+        else:
+            print(f"⚠️ No se encontraron mensajes en el estado final")
+            print(f"🔍 Estado final completo: {final_state_result}")
         
         # 4.1. Añadir el mensaje de la IA a Zep
         ai_message = Message(role="assistant", content=ai_response_content)

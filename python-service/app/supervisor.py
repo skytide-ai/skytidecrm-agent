@@ -1,8 +1,11 @@
-from typing import Literal
+from typing import Literal, Union
 from openai import OpenAI
 import pydantic_ai
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
+from langgraph.types import Command
+from langgraph.graph import END
+from langchain_core.messages import AIMessage
 
 # Importamos el estado global y funciones de Zep
 from .state import GlobalState
@@ -27,10 +30,10 @@ class SupervisorOutput(BaseModel):
     )
 
 # 3. Creamos la función del nodo supervisor que se usará en el grafo
-async def supervisor_node(state: GlobalState) -> dict:
+async def supervisor_node(state: GlobalState) -> Union[Command[Literal[*AGENT_NAMES, "__end__"]], dict]:
     """
-    Este es el nodo que orquesta el flujo de trabajo. Llama al supervisor
-    para decidir el siguiente paso usando pydantic-ai.
+    Este es el nodo que orquesta el flujo de trabajo usando el patrón Command moderno.
+    Llama al supervisor para decidir el siguiente paso usando pydantic-ai.
     Ahora incluye contexto de memoria de Zep.
     """
     print("--- Supervisor ---")
@@ -114,11 +117,26 @@ async def supervisor_node(state: GlobalState) -> dict:
     direct_response = result.data.direct_response
     
     print(f"Supervisor (con contexto Zep) ha decidido enrutar a: {next_agent_value}")
-    if direct_response:
+    
+    # SOLO generar respuesta directa si es terminate Y hay direct_response
+    if next_agent_value == TERMINATE and direct_response:
         print(f"📝 Supervisor respuesta directa: {direct_response[:100]}...")
-    
-    return_dict = {"next_agent": next_agent_value}
-    if direct_response:
-        return_dict["direct_response"] = direct_response
-    
-    return return_dict 
+        
+        # Si hay respuesta directa Y es terminate, agregar el mensaje AI al estado y terminar
+        current_messages = state.get("messages", [])
+        ai_message = AIMessage(content=direct_response)
+        current_messages.append(ai_message)
+        
+        # Retornar estado actualizado con TERMINATE para terminar
+        return {
+            "messages": current_messages,
+            "next_agent": TERMINATE
+        }
+    elif next_agent_value in ["KnowledgeAgent", "AppointmentAgent", "EscalationAgent"]:
+        # Si enruta a un agente específico, usar Command
+        print(f"🔀 Enrutando al agente: {next_agent_value}")
+        return Command(goto=next_agent_value)
+    else:
+        # Si es terminate pero sin respuesta directa, solo terminar
+        print(f"🏁 Terminando sin respuesta directa")
+        return Command(goto=END) 
