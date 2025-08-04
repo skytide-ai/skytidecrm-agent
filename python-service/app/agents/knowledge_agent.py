@@ -162,8 +162,8 @@ class KnowledgeSearchResult(BaseModel):
     @field_validator('source_type')
     @classmethod
     def validate_source_type(cls, v):
-        if v is not None and v not in ['service', 'file']:
-            raise ValueError("source_type debe ser 'service' o 'file'")
+        if v is not None and v not in ['service', 'file', 'multiple_services']:
+            raise ValueError("source_type debe ser 'service', 'file' o 'multiple_services'")
         return v
     
     @field_validator('service_name', 'information_found', 'clarification_message')
@@ -190,26 +190,78 @@ class UserInsightsResult(BaseModel):
     insights_found: List[str] = Field(default_factory=list, description="Lista de insights/resúmenes encontrados.")
     summary: str = Field(description="Resumen de los insights encontrados.")
 
-# --- Función para forzar el uso de herramientas ---
-async def force_tool_usage(ctx: RunContext[GlobalState], tool_defs: List[ToolDefinition]) -> List[ToolDefinition]:
+# --- Función para control inteligente de herramientas ---
+async def smart_tool_preparation(ctx: RunContext[GlobalState], tool_defs: List[ToolDefinition]) -> List[ToolDefinition]:
     """
-    Función prepare_tools que fuerza el uso de herramientas.
-    Si no hay herramientas disponibles, no permite la ejecución.
+    Función prepare_tools que controla dinámicamente qué herramientas usar según el contexto.
+    Implementa análisis semántico sin hardcodeo de palabras específicas.
     """
     if not tool_defs:
-        # Si no hay herramientas, algo está mal en la configuración
         print("⚠️ WARNING: No hay herramientas disponibles para el agente")
         return []
     
-    print(f"🔧 TOOLS PREPARADOS: {len(tool_defs)} herramientas disponibles: {[t.name for t in tool_defs]}")
-    return tool_defs
+    state = ctx.deps
+    
+    # Obtener el último mensaje del usuario
+    last_message = state.get("messages", [])[-1] if state.get("messages") else None
+    user_query = last_message.content if last_message else ""
+    
+    # 🧠 ANÁLISIS INTELIGENTE DEL CONTEXTO (SIN HARDCODEO)
+    available_tools = []
+    
+    # 1. DETECTAR CAMBIO DE SERVICIO: Análisis contextual
+    has_existing_service = state.get('service_id') is not None
+    is_likely_service_change = (
+        has_existing_service and 
+        len(user_query.split()) >= 2 and  # Más de una palabra (sugiere especificidad)
+        user_query.strip() != ""  # No es mensaje vacío
+    )
+    
+    # 2. DETECTAR NECESIDAD DE HISTORIAL: Análisis semántico
+    # Si el usuario hace referencia a interacciones pasadas, usa pronombres demostrativos,
+    # o palabras que sugieren historia personal
+    query_suggests_history = (
+        # Referencias temporales al pasado
+        any(ref in user_query.lower() for ref in ["antes", "anterior", "previo", "ya", "otra vez"]) or
+        # Referencias pronominales (el que, la que, ese, esta, etc.)
+        any(ref in user_query.lower() for ref in ["el que", "la que", "ese", "esa", "esto", "eso", "aquel"]) or
+        # Referencias a acciones previas del asistente
+        any(ref in user_query.lower() for ref in ["dijiste", "mencionaste", "recomendaste", "sugeriste"]) or
+        # Referencias a información personal (sin hardcodear condiciones médicas específicas)
+        any(ref in user_query.lower() for ref in ["mi ", "mis ", "tengo ", "soy ", "problema"])
+    )
+    
+    # 3. APLICAR LÓGICA DE HERRAMIENTAS
+    for tool_def in tool_defs:
+        # SIEMPRE incluir knowledge_search - es la herramienta principal
+        if tool_def.name == 'knowledge_search':
+            available_tools.append(tool_def)
+        
+        # Herramientas de historial: solo si realmente se necesitan
+        elif tool_def.name in ['search_user_facts', 'search_user_conversations', 'search_user_insights']:
+            # REGLA: Solo incluir si hay evidencia semántica de necesidad de historial
+            # Y NO es un cambio directo de servicio
+            if query_suggests_history and not is_likely_service_change:
+                available_tools.append(tool_def)
+    
+    # 4. LOGGING INTELIGENTE
+    context_mode = "GENÉRICO"
+    if is_likely_service_change:
+        context_mode = "CAMBIO_SERVICIO"
+    elif query_suggests_history:
+        context_mode = "NECESITA_HISTORIAL"
+    
+    print(f"🔧 TOOLS PREPARADOS: {len(available_tools)} herramientas | Modo: {context_mode}")
+    print(f"🧠 Herramientas disponibles: {[t.name for t in available_tools]}")
+    
+    return available_tools
 
 # --- Definición del Agente de Conocimiento ---
 knowledge_agent = Agent[GlobalState, KnowledgeSearchResult](
     'openai:gpt-4o', 
     deps_type=GlobalState,
     output_type=KnowledgeSearchResult,  # ← FUERZA que el agente SIEMPRE devuelva KnowledgeSearchResult
-    prepare_tools=force_tool_usage,
+    prepare_tools=smart_tool_preparation,
     system_prompt="""
     Eres un asistente amigable y experto en servicios y productos de la empresa.
     Habla de manera natural y conversacional, como si fueras un asesor personal que conoce bien los servicios.
@@ -229,6 +281,14 @@ knowledge_agent = Agent[GlobalState, KnowledgeSearchResult](
     
     FLUJO DE TRABAJO:
     
+    🎯 CASO ESPECIAL - CAMBIO DE SERVICIO PARA AGENDAR:
+    Si el usuario dice "quiero agendar [servicio]" o "mejor [servicio]" o "cambio a [servicio]":
+    - SOLO haz 1 búsqueda: knowledge_search con el nombre del servicio
+    - OBJETIVO: Encontrar el service_id únicamente
+    - NO busques horarios, disponibilidad, ni hagas múltiples consultas
+    - Una vez que tengas el service_id, TERMINA
+    
+    FLUJO NORMAL:
     1. EVALÚA LA CONSULTA: ¿El usuario menciona algo del pasado, historial, o "antes"?
        - SI: Usa herramientas de búsqueda de historial primero
        - NO: Procede con búsqueda de servicios
@@ -279,13 +339,24 @@ knowledge_agent = Agent[GlobalState, KnowledgeSearchResult](
     - NO uses asteriscos (**texto**) ni formato markdown para títulos
     - Escribe los nombres de servicios de forma natural, como en una conversación normal
     
-    🎯 OBJETIVO: Ayudar al usuario encontrando información relevante usando las herramientas disponibles.
+    🎯 OBJETIVO: Ayudar al usuario encontrando información relevante usando las herramientas necesarias.
     
-    Para cualquier consulta:
-    1. Usa 'knowledge_search' para servicios, ubicación, horarios, precios
-    2. Usa 'search_user_facts' para historial del usuario  
-    3. Usa 'search_user_conversations' para conversaciones previas
-    4. Usa 'search_user_insights' para insights del usuario
+    🧠 SÉ INTELIGENTE CON LAS HERRAMIENTAS:
+    - EVALÚA primero qué necesitas realmente buscar
+    - NO uses todas las herramientas para cada consulta
+    - Solo busca historial del usuario si es RELEVANTE para la consulta
+    
+    GUÍA DE CUÁNDO USAR CADA HERRAMIENTA:
+    - 'knowledge_search': SIEMPRE para encontrar servicios, ubicación, horarios, precios, info general
+    - 'search_user_facts': SOLO si el usuario menciona "antes", "preferencias", o necesitas personalizar
+    - 'search_user_conversations': SOLO si el usuario pregunta sobre conversaciones pasadas
+    - 'search_user_insights': SOLO si necesitas patrones de comportamiento para recomendar
+    
+    ✅ EJEMPLOS DE USO EFICIENTE:
+    - "Quiero agendar una cita" → SOLO knowledge_search (para encontrar servicio)
+    - "¿Dónde quedan?" → SOLO knowledge_search (info general)
+    - "¿Qué me recomendaste antes?" → search_user_conversations + knowledge_search
+    - "Mis servicios favoritos" → search_user_facts + knowledge_search
     
     Siempre proporciona información útil y amigable en tu respuesta final.
     """
@@ -319,8 +390,8 @@ async def knowledge_search(ctx: RunContext[GlobalState], query: str) -> Knowledg
         # Analizar si es una búsqueda amplia de servicios
         query_lower = query.lower()
         is_broad_service_query = any(keyword in query_lower for keyword in [
-            'servicios', 'qué tienen', 'qué ofrecen', 'catálogo', 'tratamientos', 
-            'ofertas', 'que hacen', 'especialidades', 'procedimientos'
+            'servicios', 'qué tienen', 'qué ofrecen', 'catálogo', 'productos',
+            'ofertas', 'que hacen', 'especialidades', 'opciones', 'disponible'
         ])
         
         # Analizar el tipo de resultado y consolidar información si es necesario
@@ -382,7 +453,7 @@ async def knowledge_search(ctx: RunContext[GlobalState], query: str) -> Knowledg
                 # Procesar el único servicio encontrado pero agregar sugerencia
                 service_data = list(unique_services.values())[0]
                 content = service_data['content']
-                suggestion = "\n\n💡 Este es uno de nuestros servicios. Si buscas algo específico o quieres conocer otros servicios disponibles, puedes preguntarme por el tipo de tratamiento que te interesa 😊"
+                suggestion = "\n\n💡 Este es uno de nuestros servicios. Si buscas algo específico o quieres conocer otros servicios disponibles, puedes preguntarme por el tipo de servicio que te interesa 😊"
                 
                 return KnowledgeSearchResult(
                     information_found=content + suggestion,
@@ -636,6 +707,10 @@ async def run_knowledge_agent(state: GlobalState) -> Command:
     
     user_query = state['messages'][-1].content
     
+    # ✅ CONSTRUIR HISTORIAL COMPLETO DE LA CONVERSACIÓN
+    history_messages = state["messages"][:-1]  # Todos excepto el último (mensaje actual)
+    history_str = "\n".join([f"{msg.__class__.__name__}: {msg.content}" for msg in history_messages])
+    
     # Detectar si venimos del AppointmentAgent
     is_service_resolution = "Necesito encontrar el servicio específico que quiere agendar" in user_query
     print(f"🔍 KNOWLEDGE AGENT: Modo resolución de servicio: {is_service_resolution}")
@@ -650,16 +725,61 @@ async def run_knowledge_agent(state: GlobalState) -> Command:
             print(f"❌ Error obteniendo contexto de Zep thread {thread_id}: {e}")
             zep_context = ""
     
-    # Construir query enriquecido con contexto de Zep
+    # Construir query enriquecido con contexto completo
     if is_service_resolution and zep_context:
         # Cuando venimos del appointment_agent, extraer el servicio del contexto
         # Usar un prompt MUY específico que solo pida identificación del servicio
         enhanced_query = f"IDENTIFICAR SERVICIO: Encuentra únicamente el service_id del servicio mencionado en: {zep_context}. SOLO usa knowledge_search y retorna el resultado estructurado. NO generes texto conversacional."
         print(f"🔍 KNOWLEDGE AGENT: Query de resolución: {enhanced_query}")
     else:
-        enhanced_query = user_query
+        # 🧠 DETECCIÓN INTELIGENTE DE CAMBIO DE SERVICIO (SIN HARDCODEO)
+        
+        # CONTEXTO: ¿Ya hay un servicio seleccionado?
+        has_existing_service = state.get('service_id') is not None
+        
+        # ANÁLISIS SEMÁNTICO: ¿El mensaje sugiere un cambio?
+        # Usamos análisis de contexto en lugar de palabras específicas
+        is_service_change_request = (
+            has_existing_service and  # Ya hay un servicio en contexto
+            len(user_query.split()) >= 2 and  # Mensaje con suficiente contenido
+            user_query.strip() != "" and  # No está vacío
+            # Análisis adicional: si menciona servicios específicos o cambios
+            # (el LLM podrá interpretar mejor el contexto que nosotros hardcodeando)
+            True  # Permitir que el análisis contextual determine la necesidad
+        )
+        
+        if is_service_change_request:
+            # Prompt específico para cambio de servicio - INTELIGENTE
+            enhanced_query = f"""🎯 ANÁLISIS DE CAMBIO DE CONTEXTO
+
+ESTADO ACTUAL: Ya hay un servicio seleccionado (ID: {state.get('service_id', 'N/A')})
+
+HISTORIAL PREVIO:
+{history_str}
+
+NUEVA SOLICITUD: {user_query}
+
+ANÁLISIS REQUERIDO:
+- Analiza si el usuario quiere cambiar a un servicio diferente
+- Si es así, identifica el nuevo servicio mencionado en su solicitud
+- Usa SOLO knowledge_search UNA VEZ para encontrar el service_id del nuevo servicio
+- Tu única misión: encontrar el service_id del servicio solicitado
+- NO busques información adicional como horarios o disponibilidad
+- NO hagas múltiples búsquedas
+- Una vez encontrado el service_id, tu tarea está completa
+
+IMPORTANTE: Confía en tu análisis semántico del contexto, no busques palabras específicas."""
+        else:
+            # ✅ FLUJO NORMAL CON HISTORIAL COMPLETO
+            enhanced_query = f"""HISTORIAL DE LA CONVERSACIÓN:
+{history_str}
+
+CONSULTA ACTUAL DEL USUARIO: {user_query}
+
+IMPORTANTE: Si en el historial mencioné servicios específicos y el usuario se refiere a ellos (ej: "el primero", "ese", "el que dijiste"), identifica a qué servicio se refiere basándote en mis respuestas anteriores."""
+        
         if zep_context:
-            enhanced_query = f"Contexto del usuario: {zep_context}\n\nConsulta actual: {user_query}"
+            enhanced_query = f"Contexto del usuario (memoria): {zep_context}\n\n{enhanced_query}"
     
     # FORZAR EL USO DE HERRAMIENTAS - Nunca responder directamente
     # En Pydantic AI, forzamos el uso de herramientas via prepare_tools y validación

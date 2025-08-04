@@ -43,12 +43,36 @@ async def supervisor_node(state: GlobalState) -> Command[Literal[*AGENT_NAMES, "
     print(f"🔍 service_name: {state.get('service_name')}")
     print(f"🔍 organization_id: {state.get('organization_id')}")
 
-    # --- 1. Extraer el último mensaje del usuario ---
+    # --- 1. Extraer el último mensaje del usuario Y verificar si hay respuesta de agente ---
     latest_user_message = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
+    latest_ai_message = next((m for m in reversed(state["messages"]) if isinstance(m, AIMessage)), None)
 
     if not latest_user_message:
         print("⚠️ No se encontró un mensaje de usuario para procesar. Terminando.")
         return Command(goto="__end__")
+    
+    # --- DETECTAR SI VENIMOS DE UN AGENTE QUE YA ACTUALIZÓ EL ESTADO ---
+    # Si el último mensaje AI es más reciente que el último mensaje del usuario,
+    # significa que un agente ya respondió y debemos considerar el contexto actualizado
+    if (latest_ai_message and 
+        latest_user_message and 
+        state["messages"].index(latest_ai_message) > state["messages"].index(latest_user_message)):
+        
+        print("🔄 DETECTADO: Regresando de un agente que ya procesó la solicitud")
+        print(f"🔄 Último mensaje AI: {latest_ai_message.name} - {latest_ai_message.content[:100]}...")
+        
+        # Si el KnowledgeAgent ya resolvió un servicio y hay service_id, ir directo a AppointmentAgent
+        if (latest_ai_message.name == "KnowledgeAgent" and 
+            state.get('service_id') and 
+            any(keyword in latest_user_message.content.lower() for keyword in ["agendar", "reservar", "programar", "cita"])):
+            
+            print("🔄 KnowledgeAgent resolvió servicio + usuario quiere reservar → AppointmentAgent")
+            return Command(goto="AppointmentAgent")
+        
+        # Si cualquier agente ya terminó su tarea, terminar
+        elif latest_ai_message.name in ["KnowledgeAgent", "AppointmentAgent", "EscalationAgent"]:
+            print("🔄 Agente ya completó la tarea → Terminando")
+            return Command(goto="__end__")
 
     # --- 2. Preparar el contexto para el LLM ---
     history_messages = state["messages"][:-1]
@@ -79,11 +103,17 @@ async def supervisor_node(state: GlobalState) -> Command[Literal[*AGENT_NAMES, "
     3.  **NO respondas a mensajes antiguos.** Tu tarea es actuar sobre el último input.
     4.  Sé decisivo y claro en tu enrutamiento.
 
+    **Estado Actual:**
+    - Service ID en estado: {state.get('service_id')}
+    - Service Name en estado: {state.get('service_name')}
+
     **Reglas de Enrutamiento:**
     -   Para saludos, despedidas o charla casual: responde directamente y termina (`terminate`).
     -   Para consultas **VAGAS** (ej: "info", "ayuda"): responde pidiendo más detalles y termina (`terminate`).
     -   Para preguntas **ESPECÍFICAS** sobre servicios, precios, ubicación, horarios: enruta a `KnowledgeAgent`.
-    -   Si un usuario quiere **agendar** una cita: enruta a `AppointmentAgent`.
+    -   Si un usuario quiere **reservar/agendar/programar** algo:
+        -   Si NO hay service_id en estado O el usuario menciona un servicio específico diferente al actual: enruta a `KnowledgeAgent` PRIMERO.
+        -   Si YA hay service_id y el usuario solo quiere continuar con la reserva: enruta a `AppointmentAgent`.
     -   Si el usuario pide explícitamente hablar con un **humano/asesor**: enruta a `EscalationAgent`.
     -   Si el mensaje del usuario es una simple confirmación (ej: "ok", "listo") y la tarea anterior ya se completó: responde amablemente y termina (`terminate`).
     """
