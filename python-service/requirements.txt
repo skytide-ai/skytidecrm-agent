@@ -6,4 +6,5 @@ python-dotenv
 pydantic-ai
 openai
 httpx
-supabase 
+supabase
+pytz 

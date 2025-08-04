@@ -125,19 +125,27 @@ async def handle_human_escalation(organization_id: str, chat_identity_id: str, r
         }
 
 # --- Función de Entrada (Entrypoint) para el Grafo ---
-async def run_escalation_agent(state: GlobalState) -> Dict[str, Any]:
+from langgraph.types import Command
+from langchain_core.messages import AIMessage
+
+async def run_escalation_agent(state: GlobalState) -> Command:
     """
     Punto de entrada para ejecutar el nodo de escalación.
+    Usa Command pattern para terminar correctamente el flujo.
     """
     print("--- Ejecutando Escalation Agent ---")
+    
+    # Obtener mensajes actuales para conservar el historial
+    current_messages = state.get("messages", [])
     
     # Validar que tenemos la información necesaria
     if not state.get('chat_identity_id'):
         print("❌ Error: No se encontró chat_identity_id en el estado")
-        return {
-            "messages": [("ai", "Lo siento, hubo un error interno. Por favor, intenta nuevamente.")],
-            "next_agent": "terminate"
-        }
+        ai_message = AIMessage(content="Lo siento, hubo un error interno. Por favor, intenta nuevamente.", name="EscalationAgent")
+        return Command(
+            update={"messages": current_messages + [ai_message]},
+            goto="__end__"
+        )
     
     # Nota: Ya no requiere contact_id, se obtiene internamente desde chat_identity
     
@@ -157,7 +165,8 @@ async def run_escalation_agent(state: GlobalState) -> Dict[str, Any]:
     else:
         final_message = "Lo siento, hubo un problema al procesar tu solicitud. Por favor, intenta nuevamente o contacta directamente a nuestro equipo."
     
-    return {
-        "messages": [("ai", final_message)],
-        "next_agent": "terminate" # Le indicamos al supervisor que termine la ejecución del grafo.
-    } 
+    ai_message = AIMessage(content=final_message, name="EscalationAgent")
+    return Command(
+        update={"messages": current_messages + [ai_message]},
+        goto="__end__"  # Escalación siempre termina el flujo
+    ) 

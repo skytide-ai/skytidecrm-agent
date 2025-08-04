@@ -36,6 +36,12 @@ async def supervisor_node(state: GlobalState) -> Command[Literal[*AGENT_NAMES, "
     y decide qué hacer a continuación, utilizando el historial como contexto.
     """
     print("--- Supervisor ---")
+    
+    # DEBUG: Mostrar el estado que recibe el supervisor
+    print(f"🔍 DEBUG Supervisor recibiendo estado:")
+    print(f"🔍 service_id: {state.get('service_id')}")
+    print(f"🔍 service_name: {state.get('service_name')}")
+    print(f"🔍 organization_id: {state.get('organization_id')}")
 
     # --- 1. Extraer el último mensaje del usuario ---
     latest_user_message = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
@@ -59,8 +65,7 @@ async def supervisor_node(state: GlobalState) -> Command[Literal[*AGENT_NAMES, "
             print(f"⚠️ No se pudo obtener contexto de Zep para thread {thread_id}. Error: {e}")
 
     # --- 3. Construir el Prompt para el Supervisor ---
-    system_prompt = f\"\"\"
-    Eres un asistente virtual experto en un centro de belleza. Tu única función es analizar el MENSAJE MÁS RECIENTE del usuario y decidir el siguiente paso.
+    system_prompt = f"""Eres un asistente virtual experto de la empresa. Tu única función es analizar el MENSAJE MÁS RECIENTE del usuario y decidir el siguiente paso.
 
     **Contexto de la Conversación (Mensajes Anteriores):**
     {history_str}
@@ -81,12 +86,12 @@ async def supervisor_node(state: GlobalState) -> Command[Literal[*AGENT_NAMES, "
     -   Si un usuario quiere **agendar** una cita: enruta a `AppointmentAgent`.
     -   Si el usuario pide explícitamente hablar con un **humano/asesor**: enruta a `EscalationAgent`.
     -   Si el mensaje del usuario es una simple confirmación (ej: "ok", "listo") y la tarea anterior ya se completó: responde amablemente y termina (`terminate`).
-    \"\"\"
+    """
     
-    user_input_for_llm = f\"\"\"
+    user_input_for_llm = f"""
     **MENSAJE DEL USUARIO A PROCESAR:**
     "{latest_user_message.content}"
-    \"\"\"
+    """
 
     # --- 4. Invocar el LLM (Supervisor) ---
     supervisor_agent = Agent[GlobalState](
@@ -118,4 +123,10 @@ async def supervisor_node(state: GlobalState) -> Command[Literal[*AGENT_NAMES, "
     
     # Si no hay respuesta directa, simplemente enruta al siguiente agente.
     # El agente se encargará de añadir su propia respuesta al estado.
-    return Command(goto=next_agent_value) 
+    # IMPORTANTE: Mantener el estado actual al enrutar
+    
+    print(f"🔍 DEBUG Supervisor enviando a {next_agent_value} con estado:")
+    print(f"🔍 service_id: {state.get('service_id')}")
+    print(f"🔍 service_name: {state.get('service_name')}")
+    
+    return Command(goto=next_agent_value)

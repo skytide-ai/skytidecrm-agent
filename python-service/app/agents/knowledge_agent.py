@@ -1,7 +1,7 @@
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, Field
 import pydantic_ai
-from openai import OpenAI
+from openai import AsyncOpenAI
 from pydantic_ai import Agent, RunContext
 import asyncio
 
@@ -13,7 +13,7 @@ from ..db import supabase_client
 # --- Cliente Pydantic AI ---
 # Usamos un cliente de OpenAI independiente para este agente
 # para mantener los contextos de herramientas separados.
-client = OpenAI()
+client = AsyncOpenAI()
 
 # --- Funciones Auxiliares para Búsqueda Semántica ---
 
@@ -22,7 +22,7 @@ async def generate_embedding(text: str) -> List[float]:
     Genera un embedding para el texto usando OpenAI.
     """
     try:
-        response = client.embeddings.create(
+        response = await client.embeddings.create(
             model="text-embedding-3-small",
             input=text
         )
@@ -44,24 +44,39 @@ async def search_knowledge_semantic(query: str, organization_id: str, limit: int
         Lista de contenido encontrado (servicios y archivos) con sus metadatos
     """
     try:
-        # Generar embedding de la consulta
+        import time
+        start_time = time.time()
+        print(f"[{start_time:.2f}] --- Iniciando búsqueda semántica para: '{query}'")
+
+        # Generar embedding de la consulta (esta función sí es async y debe ser esperada)
         query_embedding = await generate_embedding(query)
         
         if not query_embedding:
             return []
         
-        # Buscar en knowledge_base usando similarity search
-        # Usamos la función match_documents de Supabase que maneja embeddings
-        # AÑADIMOS EL FILTRO POR ORGANIZATION_ID AQUÍ
-        result = await supabase_client.rpc(
-            'match_documents',
-            {
-                'query_embedding': query_embedding,
-                'match_count': limit,
-                'p_organization_id': organization_id
-            }
-        ).execute()
-        
+        embedding_time = time.time()
+        print(f"[{embedding_time:.2f}] --- Embedding generado en {embedding_time - start_time:.2f}s")
+
+        # Buscar en knowledge_base usando la sintaxis correcta para ejecutar
+        # una llamada síncrona (rpc) desde un contexto asíncrono.
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, 
+            lambda: supabase_client.rpc(
+                'match_documents_by_org',
+                {
+                    'query_embedding': query_embedding,
+                    'match_threshold': 0.2,
+                    'match_count': limit,
+                    'org_id': organization_id
+                }
+            ).execute()
+        )
+
+        rpc_time = time.time()
+        print(f"[{rpc_time:.2f}] --- RPC a Supabase completado en {rpc_time - embedding_time:.2f}s")
+        print(f"🔍 DEBUG: RPC retornó {len(result.data) if result.data else 0} resultados")
+
         results_found = []
         seen_items = set()
         
@@ -96,6 +111,8 @@ async def search_knowledge_semantic(query: str, organization_id: str, limit: int
                             'metadata': metadata
                         })
         
+        end_time = time.time()
+        print(f"[{end_time:.2f}] --- Búsqueda semántica completada en {end_time - start_time:.2f}s")
         return results_found
         
     except Exception as e:
@@ -107,7 +124,11 @@ async def get_service_by_id(service_id: str) -> Optional[Dict[str, Any]]:
     Obtiene información completa de un servicio por su ID.
     """
     try:
-        result = supabase_client.table('services').select('*').eq('id', service_id).execute()
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: supabase_client.table('services').select('*').eq('id', service_id).execute()
+        )
         
         if result.data:
             return result.data[0]
@@ -158,7 +179,8 @@ knowledge_agent = Agent[GlobalState](
     'openai:gpt-4o', 
     deps_type=GlobalState,
     system_prompt="""
-    Eres un asistente experto en la oferta de servicios de un centro de estética.
+    Eres un asistente amigable y experto en servicios y productos de la empresa.
+    Habla de manera natural y conversacional, como si fueras un asesor personal que conoce bien los servicios.
     Tu trabajo es ayudar al usuario a encontrar y seleccionar el servicio que desea, utilizando tanto la información actual como el historial del usuario.
 
     HERRAMIENTAS DISPONIBLES:
@@ -181,7 +203,7 @@ knowledge_agent = Agent[GlobalState](
     
     2. BÚSQUEDA DE INFORMACIÓN:
        - Usa 'knowledge_search' para encontrar servicios O información general
-       - Para servicios: incluye service_id, nombre y si requiere valoración
+       - Para servicios: incluye nombre, descripción y detalles relevantes
        - Para info general: incluye contenido directo (ubicación, horarios, etc.)
        - Si necesitas aclaración, devuelve el mensaje y termina
     
@@ -200,14 +222,14 @@ knowledge_agent = Agent[GlobalState](
     - "¿Políticas?" / "reglas" / "términos" → Encuentra políticas
     
     SERVICIOS:
-    - "Quiero algo para rejuvenecer" → Busca servicios
+    - "Quiero un servicio que me ayude con [problema]" → Busca servicios
     - "¿Cuánto cuesta [nombre del servicio]?" → Busca servicio específico
     
     HISTORIAL DEL USUARIO:
     - "¿Qué servicios me recomendaste antes?" → search_user_conversations
     - "¿Cuáles fueron mis servicios favoritos?" → search_user_facts
     - "¿Tuve algún problema?" → search_user_facts
-    - "¿He venido antes por problemas de acné?"
+    - "¿He venido antes por este tipo de problema?"
     
     🚨 REGLAS CRÍTICAS:
     - NUNCA INVENTES información que no encuentres en las herramientas
@@ -216,7 +238,20 @@ knowledge_agent = Agent[GlobalState](
     - SOLO usa datos reales retornados por las herramientas de búsqueda
     - NO hagas suposiciones sobre qué servicios podrían existir
     
-    IMPORTANTE: No respondas directamente al usuario, solo ejecuta las herramientas necesarias y devuelve sus resultados estructurados.
+    📝 FORMATO DE RESPUESTAS:
+    - Habla de manera natural y conversacional, evita listas técnicas
+    - Usa un tono amigable como "Te cuento que...", "Mira, tenemos...", "Perfecto, aquí está..."
+    - Organiza la información de manera fluida, no como puntos de lista
+    - Cuando presentes múltiples servicios, hazlo como si estuvieras recomendando personalmente
+    - USA EMOJIS para hacer la conversación más natural y amigable 😊
+    - NO uses asteriscos (**texto**) ni formato markdown para títulos
+    - Escribe los nombres de servicios de forma natural, como en una conversación normal
+    
+    🚨 OBLIGATORIO: SIEMPRE debes usar las herramientas disponibles para buscar información. NUNCA respondas directamente sin usar herramientas.
+    
+    - Para CUALQUIER consulta sobre servicios, ubicación, horarios, precios → USA 'knowledge_search'
+    - Para preguntas sobre historial del usuario → USA las herramientas de búsqueda de usuario
+    - NO tengas conversaciones directas, SIEMPRE delega a las herramientas correspondientes
     """
 )
 
@@ -237,32 +272,92 @@ async def knowledge_search(ctx: RunContext[GlobalState], query: str) -> Knowledg
     print(f"🔍 Buscando información para: '{query}' en organización {organization_id}")
     
     try:
-        # Buscar con límite de 3 resultados más relevantes
-        matching_results = await search_knowledge_semantic(query, organization_id, limit=3)
+        # Buscar con límite más alto para capturar todos los chunks de un servicio
+        matching_results = await search_knowledge_semantic(query, organization_id, limit=10)
         
         if not matching_results:
             return KnowledgeSearchResult(
                 clarification_message=f"No encontré información específica sobre '{query}'. ¿Te gustaría hablar con un asesor que pueda ayudarte mejor?"
             )
         
-        # Tomar el resultado más relevante (primero)
+        # Analizar si es una búsqueda amplia de servicios
+        query_lower = query.lower()
+        is_broad_service_query = any(keyword in query_lower for keyword in [
+            'servicios', 'qué tienen', 'qué ofrecen', 'catálogo', 'tratamientos', 
+            'ofertas', 'que hacen', 'especialidades', 'procedimientos'
+        ])
+        
+        # Analizar el tipo de resultado y consolidar información si es necesario
         best_result = matching_results[0]
         metadata = best_result.get('metadata', {})
         source_type = metadata.get('source_type')
-        content = best_result.get('content', '')
         similarity = best_result.get('similarity', 0)
         
         print(f"✅ Información encontrada: source_type={source_type}, similarity={similarity:.2f}")
-        print(f"📄 Content preview: {content[:100]}...")
+        print(f"🔍 Búsqueda amplia de servicios detectada: {is_broad_service_query}")
         
         # 🎯 UMBRAL DE SIMILARITY: Si la similarity es muy baja, no es información útil
-        if similarity < 0.3:  # Ajustar este valor según necesidades
+        if similarity < 0.1:  # Ajustar este valor según necesidades
             return KnowledgeSearchResult(
                 clarification_message=f"No encontré información específica sobre '{query}'. ¿Podrías ser más específico sobre qué tipo de información necesitas? Por ejemplo: servicios, precios, ubicación, horarios, etc. Si prefieres, también puedo ayudarte a contactar con un asesor."
             )
         
+        # 📋 MANEJO ESPECIAL PARA BÚSQUEDAS AMPLIAS DE SERVICIOS
+        if is_broad_service_query and source_type == 'service':
+            # Obtener servicios únicos de los resultados
+            unique_services = {}
+            for result in matching_results:
+                result_metadata = result.get('metadata', {})
+                if result_metadata.get('source_type') == 'service':
+                    service_id = result_metadata.get('service_id')
+                    similarity_score = result.get('similarity', 0)
+                    
+                    # Solo incluir si tiene buena similarity
+                    if similarity_score >= 0.1 and service_id:
+                        if service_id not in unique_services or similarity_score > unique_services[service_id]['similarity']:
+                            unique_services[service_id] = {
+                                'content': result.get('content', ''),
+                                'similarity': similarity_score,
+                                'metadata': result_metadata
+                            }
+            
+            # Si tenemos múltiples servicios, mostrarlos todos
+            if len(unique_services) > 1:
+                services_info = []
+                for service_id, service_data in unique_services.items():
+                    content = service_data['content']
+                    # Extraer nombre del servicio de los metadatos o contenido
+                    service_name = service_data['metadata'].get('service_name', 'Servicio')
+                    services_info.append(f"🌟 {service_name}\n{content}")
+                
+                consolidated_services = "\n\n".join(services_info)
+                
+                # Agregar sugerencia inteligente para más detalles
+                suggestion = "\n\n💡 Si quieres información más detallada sobre algún servicio específico (como precios, contraindicaciones, o cuidados), solo menciona el nombre del servicio que te interesa 😊"
+                
+                return KnowledgeSearchResult(
+                    information_found=consolidated_services + suggestion,
+                    source_type='multiple_services',
+                    category='servicios'
+                )
+            
+            # Si solo hay un servicio pero era una búsqueda amplia, sugerir más opciones
+            elif len(unique_services) == 1:
+                # Procesar el único servicio encontrado pero agregar sugerencia
+                service_data = list(unique_services.values())[0]
+                content = service_data['content']
+                suggestion = "\n\n💡 Este es uno de nuestros servicios. Si buscas algo específico o quieres conocer otros servicios disponibles, puedes preguntarme por el tipo de tratamiento que te interesa 😊"
+                
+                return KnowledgeSearchResult(
+                    information_found=content + suggestion,
+                    source_type='service',
+                    service_id=list(unique_services.keys())[0]
+                )
+        
         if source_type == 'file':
-            # Es información general (ubicación, horarios, etc.)
+            # Es información general (ubicación, horarios, etc.) - usar solo el mejor resultado
+            content = best_result.get('content', '')
+            print(f"📄 Content preview: {content[:100]}...")
             return KnowledgeSearchResult(
                 information_found=content,
                 source_type='file',
@@ -270,18 +365,78 @@ async def knowledge_search(ctx: RunContext[GlobalState], query: str) -> Knowledg
             )
         
         elif source_type == 'service':
-            # Es información de un servicio
+            # Es información de un servicio - CONSOLIDAR TODOS LOS CHUNKS DEL MISMO SERVICIO
             service_id = metadata.get('service_id')
-            service_data = await get_service_by_id(service_id)
+            service_name = metadata.get('service_name', 'Servicio')
+            
+            print(f"🔍 DEBUG: Buscando chunks para service_id={service_id}")
+            print(f"🔍 DEBUG: Total de resultados recibidos: {len(matching_results)}")
+            
+            # DEBUG: Mostrar todos los resultados para diagnosticar
+            for i, result in enumerate(matching_results):
+                result_metadata = result.get('metadata', {})
+                result_service_id = result_metadata.get('service_id')
+                result_source_type = result_metadata.get('source_type')
+                result_similarity = result.get('similarity', 0)
+                print(f"🔍 DEBUG: Resultado {i+1} - service_id={result_service_id}, source_type={result_source_type}, similarity={result_similarity:.2f}")
+            
+            # Filtrar todos los resultados del mismo servicio (con similarity mínima)
+            service_chunks = []
+            for r in matching_results:
+                r_metadata = r.get('metadata', {})
+                r_service_id = r_metadata.get('service_id')
+                r_source_type = r_metadata.get('source_type')
+                r_similarity = r.get('similarity', 0)
+                
+                # Incluir si es del mismo servicio Y tiene buena similarity
+                if (r_source_type == 'service' and 
+                    r_service_id == service_id and 
+                    r_similarity >= 0.1):
+                    service_chunks.append(r)
+            
+            print(f"📋 DEBUG: Chunks del mismo servicio encontrados: {len(service_chunks)}")
+            
+            # Consolidar toda la información del servicio
+            consolidated_content = []
+            for chunk in service_chunks:
+                chunk_content = chunk.get('content', '')
+                chunk_similarity = chunk.get('similarity', 0)
+                print(f"📄 Chunk encontrado (similitud: {chunk_similarity:.2f}): {chunk_content[:80]}...")
+                consolidated_content.append(chunk_content)
+            
+            # Si no encontramos chunks adicionales, buscar otros chunks de servicio con similarity alta
+            if len(service_chunks) == 1:
+                print("🔍 Solo se encontró 1 chunk, buscando otros chunks de servicios relacionados...")
+                for r in matching_results:
+                    r_metadata = r.get('metadata', {})
+                    r_source_type = r_metadata.get('source_type')
+                    r_similarity = r.get('similarity', 0)
+                    
+                    # Incluir otros chunks de servicios con alta similarity que no hayamos incluido ya
+                    if (r_source_type == 'service' and 
+                        r_similarity >= 0.3 and  # Similarity más alta para otros servicios
+                        r not in service_chunks):
+                        
+                        chunk_content = r.get('content', '')
+                        print(f"📄 Chunk adicional relacionado (similitud: {r_similarity:.2f}): {chunk_content[:80]}...")
+                        consolidated_content.append(chunk_content)
+            
+            # Unir todo el contenido con formato más conversacional
+            full_service_info = "\n\n".join(consolidated_content)
+            print(f"📋 Información consolidada del servicio ({len(consolidated_content)} chunks)")
+            
+            # Formatear de manera más conversacional
+            conversational_info = f"Te cuento sobre {service_name} ✨\n\n{full_service_info}"
+            
             return KnowledgeSearchResult(
-                service_id=service_id,
-                service_name=service_data['name'] if service_data else None,
-                requires_assessment=service_data['requiere_valoracion'] if service_data else None,
-                source_type='service'
+                information_found=conversational_info,
+                source_type='service',
+                service_id=service_id
             )
         
         else:
             # Tipo de fuente desconocido, devolver contenido como información general
+            content = best_result.get('content', '')
             return KnowledgeSearchResult(
                 information_found=content,
                 source_type='unknown'
@@ -302,9 +457,9 @@ async def search_user_facts(ctx: RunContext[GlobalState], query: str) -> UserFac
     
     Ejemplos de uso:
     - "servicios previos" 
-    - "problemas de piel"
+    - "problemas reportados"
     - "preferencias de horarios"
-    - "reacciones alérgicas"
+    - "alergias o restricciones"
     """
     state = ctx.deps
     print(f"🔍 Buscando hechos del usuario para: '{query}'")
@@ -433,14 +588,21 @@ async def search_user_insights(ctx: RunContext[GlobalState], query: str) -> User
         )
 
 # --- Función de Entrada (Entrypoint) para el Grafo ---
-async def run_knowledge_agent(state: GlobalState) -> Dict[str, Any]:
+from langgraph.types import Command
+from langgraph.graph import END
+
+async def run_knowledge_agent(state: GlobalState) -> Command:
     """
     Punto de entrada para ejecutar el agente de conocimiento.
-    Ahora incluye contexto de memoria de Zep.
+    Ahora incluye contexto de memoria de Zep y usa Command pattern para evitar loops.
     """
     print("--- Ejecutando Knowledge Agent ---")
     
     user_query = state['messages'][-1].content
+    
+    # Detectar si venimos del AppointmentAgent
+    is_service_resolution = "Necesito encontrar el servicio específico que quiere agendar" in user_query
+    print(f"🔍 KNOWLEDGE AGENT: Modo resolución de servicio: {is_service_resolution}")
     
     # Obtener contexto de memoria de Zep si hay chat_identity_id
     zep_context = ""
@@ -453,69 +615,146 @@ async def run_knowledge_agent(state: GlobalState) -> Dict[str, Any]:
             zep_context = ""
     
     # Construir query enriquecido con contexto de Zep
-    enhanced_query = user_query
-    if zep_context:
-        enhanced_query = f"Contexto del usuario: {zep_context}\n\nConsulta actual: {user_query}"
+    if is_service_resolution and zep_context:
+        # Cuando venimos del appointment_agent, extraer el servicio del contexto
+        enhanced_query = f"Buscar servicio específico mencionado en: {zep_context}"
+        print(f"🔍 KNOWLEDGE AGENT: Query de resolución: {enhanced_query}")
+    else:
+        enhanced_query = user_query
+        if zep_context:
+            enhanced_query = f"Contexto del usuario: {zep_context}\n\nConsulta actual: {user_query}"
     
     result = await knowledge_agent.run(enhanced_query, deps=state)
     
     # El resultado del agente puede ser de varios tipos, lo procesamos
     tool_output = result.output
+    print(f"🔍 DEBUG: tool_output type: {type(tool_output)}")
+    print(f"🔍 DEBUG: tool_output value: {tool_output}")
+
+    # Obtener mensajes actuales para conservar el historial
+    current_messages = state.get("messages", [])
 
     if isinstance(tool_output, KnowledgeSearchResult):
+        print(f"🔍 DEBUG KnowledgeSearchResult:")
+        print(f"🔍 clarification_message: {bool(tool_output.clarification_message)}")
+        print(f"🔍 service_id: {tool_output.service_id}")
+        print(f"🔍 information_found: {bool(tool_output.information_found)}")
+        
         if tool_output.clarification_message:
             # Si la herramienta devuelve un mensaje de clarificación (incluso si falló),
             # lo tratamos como la respuesta final de este turno para romper el bucle.
-            return {
-                "messages": [("ai", tool_output.clarification_message)]
-            }
+            from langchain_core.messages import AIMessage
+            ai_message = AIMessage(content=tool_output.clarification_message, name="KnowledgeAgent")
+            return Command(
+                update={"messages": current_messages + [ai_message]},
+                goto="__end__"
+            )
         elif tool_output.service_id:
             # Si se encontró un servicio, incluir información de valoración si está disponible
-            result_data = {"service_id": tool_output.service_id}
+            # y enrutar al AppointmentAgent para posible agendamiento
+            print(f"📋 KNOWLEDGE AGENT: PATH service_id - Actualizando estado con service_id: {tool_output.service_id}")
+            
+            result_data = {
+                "service_id": tool_output.service_id,
+                "messages": current_messages
+            }
             if tool_output.requires_assessment is not None:
                 result_data["requires_assessment"] = tool_output.requires_assessment
             if tool_output.service_name:
                 result_data["service_name"] = tool_output.service_name
-            return result_data
+                print(f"📋 KNOWLEDGE AGENT: PATH service_id - Actualizando estado con service_name: {tool_output.service_name}")
+            
+            print(f"📋 KNOWLEDGE AGENT: PATH service_id - result_data completo: {result_data}")
+            
+            # Si estamos en modo resolución, regresar directamente al AppointmentAgent
+            if is_service_resolution:
+                print(f"📋 KNOWLEDGE AGENT: Modo resolución - regresando a AppointmentAgent con service_id")
+                return Command(
+                    update=result_data,
+                    goto="AppointmentAgent"
+                )
+            else:
+                # Retornar al supervisor para que decida si ir a AppointmentAgent
+                return Command(
+                    update=result_data,
+                    goto="Supervisor"
+                )
         elif tool_output.information_found:
-            # Si se encontró información general (archivos), devolverla directamente
-            return {
-                "messages": [("ai", tool_output.information_found)],
-                "next_agent": "terminate"  # Indicar que la tarea se completó
-            }
+            # Si se encontró información general (archivos o servicios), devolverla directamente y terminar
+            from langchain_core.messages import AIMessage
+            ai_message = AIMessage(content=tool_output.information_found, name="KnowledgeAgent")
+            
+            # IMPORTANTE: Si es información de un servicio, también actualizar el service_id en el estado
+            update_data = {"messages": current_messages + [ai_message]}
+            if tool_output.service_id:
+                update_data["service_id"] = tool_output.service_id
+                print(f"📋 KNOWLEDGE AGENT: Actualizando estado con service_id: {tool_output.service_id}")
+                print(f"📋 KNOWLEDGE AGENT: update_data completo: {update_data}")
+            if tool_output.service_name:
+                update_data["service_name"] = tool_output.service_name
+                print(f"📋 KNOWLEDGE AGENT: Actualizando estado con service_name: {tool_output.service_name}")
+            if tool_output.requires_assessment is not None:
+                update_data["requires_assessment"] = tool_output.requires_assessment
+            
+            return Command(
+                update=update_data,
+                goto="__end__"
+            )
     
     elif isinstance(tool_output, UserFactsResult):
         if tool_output.facts_found:
             facts_text = "\n".join([f"- {fact}" for fact in tool_output.facts_found])
             response_message = f"{tool_output.summary}\n\n{facts_text}"
-            return {"messages": [("ai", response_message)]}
+            from langchain_core.messages import AIMessage
+            ai_message = AIMessage(content=response_message, name="KnowledgeAgent")
+            return Command(
+                update={"messages": current_messages + [ai_message]},
+                goto="__end__"
+            )
         else:
-            # Si no se encuentran hechos, no se devuelve ningún mensaje para evitar bucles.
-            return {}
+            # Si no se encuentran hechos, regresar al supervisor para que decida
+            return Command(goto="Supervisor")
     
     elif isinstance(tool_output, UserSessionsResult):
         if tool_output.conversations_found:
             conversations_text = "\n".join([f"- {conv}" for conv in tool_output.conversations_found])
             response_message = f"{tool_output.summary}\n\n{conversations_text}"
-            return {"messages": [("ai", response_message)]}
+            from langchain_core.messages import AIMessage
+            ai_message = AIMessage(content=response_message, name="KnowledgeAgent")
+            return Command(
+                update={"messages": current_messages + [ai_message]},
+                goto="__end__"
+            )
         else:
-            return {}
+            return Command(goto="Supervisor")
 
     elif isinstance(tool_output, UserInsightsResult):
         if tool_output.insights_found:
             insights_text = "\n".join([f"- {insight}" for insight in tool_output.insights_found])
             response_message = f"{tool_output.summary}\n\n{insights_text}"
-            return {"messages": [("ai", response_message)]}
+            from langchain_core.messages import AIMessage
+            ai_message = AIMessage(content=response_message, name="KnowledgeAgent")
+            return Command(
+                update={"messages": current_messages + [ai_message]},
+                goto="__end__"
+            )
         else:
-            return {}
+            return Command(goto="Supervisor")
 
     # Si el resultado es un string directo (respuesta del LLM)
     elif isinstance(tool_output, str):
-        return {
-            "messages": [("ai", tool_output)]
-        }
+        from langchain_core.messages import AIMessage
+        ai_message = AIMessage(content=tool_output, name="KnowledgeAgent")
+        return Command(
+            update={"messages": current_messages + [ai_message]},
+            goto="__end__"
+        )
 
-    # Caso por defecto o si la salida no es lo que esperamos
-    return {
-        "messages": [("ai", "No estoy seguro de cómo proceder. ¿Puedes reformular tu pregunta?")]
-    }
+    # Caso por defecto o si la salida no es lo que esperamos (ej. búsqueda vacía)
+    print("⚠️ El Knowledge Agent no produjo una salida clara. Terminando para evitar bucle.")
+    from langchain_core.messages import AIMessage
+    ai_message = AIMessage(content="No estoy seguro de cómo proceder. ¿Puedes reformular tu pregunta? Si lo prefieres, puedo contactar a un asesor.", name="KnowledgeAgent")
+    return Command(
+        update={"messages": current_messages + [ai_message]},
+        goto="__end__"
+    )

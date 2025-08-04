@@ -41,10 +41,8 @@ workflow.add_node("Supervisor", supervisor_node)
 
 workflow.set_entry_point("Supervisor")
 
-# Edges de regreso de agentes al supervisor
-workflow.add_edge("KnowledgeAgent", "Supervisor")
-workflow.add_edge("AppointmentAgent", "Supervisor") 
-workflow.add_edge("EscalationAgent", "Supervisor")
+# Con Command pattern, NO necesitamos edges fijos
+# Los agentes ahora usan Command(goto=...) para controlar el flujo
 
 # Con Command pattern, NO necesitamos conditional edges
 # El supervisor maneja automáticamente el routing usando Command(goto=...)
@@ -63,14 +61,19 @@ async def get_contact_data(contact_id: str, organization_id: str) -> Optional[Di
         Dict con first_name, last_name, phone, etc. o None si no se encuentra
     """
     try:
+        import asyncio
         from .db import supabase_client
         
-        response = await supabase_client.table('contacts')\
-            .select('first_name, last_name, phone, country_code')\
-            .eq('id', contact_id)\
-            .eq('organization_id', organization_id)\
-            .maybe_single()\
-            .execute()
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: supabase_client.table('contacts')\
+                .select('first_name, last_name, phone, country_code')\
+                .eq('id', contact_id)\
+                .eq('organization_id', organization_id)\
+                .maybe_single()\
+                .execute()
+        )
         
         if response.data:
             return response.data
@@ -101,14 +104,6 @@ app = FastAPI()
 @app.get("/")
 def read_root():
     return {"Hello": "World"}
-
-@app.post("/chat")
-async def chat(payload: InvokePayload, request: Request):
-    """
-    Ruta de chat para pruebas y desarrollo.
-    Alias de /invoke con el mismo comportamiento.
-    """
-    return await invoke(payload, request)
 
 @app.post("/invoke")
 async def invoke(payload: InvokePayload, request: Request):
