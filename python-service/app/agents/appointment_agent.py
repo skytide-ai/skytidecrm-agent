@@ -1,6 +1,7 @@
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from uuid import UUID
 import pydantic_ai
 from openai import OpenAI
 from pydantic_ai import Agent, RunContext
@@ -13,21 +14,40 @@ from ..zep import get_zep_memory_context
 # --- Cliente Pydantic AI ---
 client = OpenAI()
 
-# --- Modelos de Datos para Herramientas ---
+# --- Modelos de Datos para Herramientas con Validación ---
 class AvailabilitySlot(BaseModel):
-    start_time: str
-    end_time: str
-    member_id: str
+    """Slot de disponibilidad con validación de horarios y UUID."""
+    start_time: str = Field(description="Hora de inicio en formato HH:MM")
+    end_time: str = Field(description="Hora de fin en formato HH:MM")
+    member_id: UUID = Field(description="ID único del miembro (UUID válido)")
+    
+    @field_validator('start_time', 'end_time')
+    @classmethod
+    def validate_time_format(cls, v):
+        try:
+            datetime.strptime(v, '%H:%M')
+            return v
+        except ValueError:
+            raise ValueError("Formato de hora debe ser HH:MM")
 
 class AppointmentConfirmation(BaseModel):
-    success: bool
-    appointment_id: Optional[str] = None
-    message: str
-    opt_in_status: Optional[str] = "not_set" # Puede ser "opt_in", "opt_out", o "not_set"
+    """Confirmación de cita con validación de UUID opcional."""
+    success: bool = Field(description="Si la cita fue creada exitosamente")
+    appointment_id: Optional[UUID] = Field(default=None, description="ID único de la cita (UUID válido)")
+    message: str = Field(min_length=1, description="Mensaje de confirmación para el usuario")
+    opt_in_status: Optional[str] = Field(default="not_set", description="Estado de opt-in del usuario")
+    
+    @field_validator('opt_in_status')
+    @classmethod
+    def validate_opt_in_status(cls, v):
+        if v not in ["opt_in", "opt_out", "not_set"]:
+            raise ValueError("opt_in_status debe ser 'opt_in', 'opt_out' o 'not_set'")
+        return v
 
 class AppointmentInfo(BaseModel):
-    appointment_id: str
-    summary: str
+    """Información de cita con validación UUID."""
+    appointment_id: UUID = Field(description="ID único de la cita (UUID válido)")
+    summary: str = Field(min_length=1, description="Resumen de la información de la cita")
 
 # --- Definición del Agente de Citas ---
 appointment_agent = Agent[GlobalState](
@@ -247,14 +267,21 @@ async def check_availability(
                     available_slots_list.append(AvailabilitySlot(
                         start_time=slot_start.strftime('%H:%M'),
                         end_time=slot_end.strftime('%H:%M'),
-                        member_id=member_id
+                        member_id=UUID(member_id)  # Convertir string a UUID
                     ))
                 current_time += datetime.timedelta(minutes=15)
 
-        unique_slots = [dict(t) for t in {tuple(d.items()) for d in [s.dict() for s in available_slots_list]}]
-        sorted_slots = sorted(unique_slots, key=lambda x: datetime.datetime.strptime(x['start_time'], '%H:%M'))
-
-        return [AvailabilitySlot(**s) for s in sorted_slots]
+        # Convertir a dict pero manteniendo UUIDs como objetos para la reconstrucción
+        unique_slots = []
+        seen_slots = set()
+        for slot in available_slots_list:
+            slot_tuple = (slot.start_time, slot.end_time, str(slot.member_id))
+            if slot_tuple not in seen_slots:
+                seen_slots.add(slot_tuple)
+                unique_slots.append(slot)
+                
+        sorted_slots = sorted(unique_slots, key=lambda x: datetime.datetime.strptime(x.start_time, '%H:%M'))
+        return sorted_slots
     except Exception as e:
         print(f"Error en check_availability: {e}")
         return []
@@ -297,7 +324,7 @@ async def book_appointment(
         appointment_data = {
             "contact_id": contact_id,
             "service_id": service_id,
-            "member_id": member_id,
+            "member_id": str(member_id),  # Convertir UUID a string para la base de datos
             "appointment_date": appointment_date,
             "start_time": start_datetime.strftime('%H:%M:%S'),
             "end_time": end_datetime.strftime('%H:%M:%S'),
@@ -332,7 +359,7 @@ async def book_appointment(
 
         return AppointmentConfirmation(
             success=True,
-            appointment_id=appointment_id,
+            appointment_id=UUID(appointment_id) if appointment_id else None,  # Convertir string a UUID
             opt_in_status=opt_in_status,
             message=f"Cita agendada con éxito para el {appointment_date} a las {start_time}."
         )
@@ -413,7 +440,7 @@ async def get_user_appointments(
             return []
 
         return [AppointmentInfo(
-            appointment_id=appt['id'],
+            appointment_id=UUID(appt['id']),  # Convertir string a UUID
             summary=f"Cita para '{appt['services']['name'] if appt.get('services') else ''}' con {appt['profiles']['first_name'] if appt.get('profiles') else ''} el {appt['appointment_date']} a las {appt['start_time']}"
         ) for appt in response.data]
     except Exception as e:

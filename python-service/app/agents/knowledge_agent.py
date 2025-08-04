@@ -1,8 +1,10 @@
 from typing import Dict, Any, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from uuid import UUID
 import pydantic_ai
 from openai import AsyncOpenAI
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.tools import ToolDefinition
 import asyncio
 
 # Importamos el estado global y funciones de Zep
@@ -143,19 +145,33 @@ async def get_service_by_id(service_id: str) -> Optional[Dict[str, Any]]:
 # --- Modelos de Respuesta ---
 
 class KnowledgeSearchResult(BaseModel):
-    """Modelo para el resultado de la búsqueda de conocimiento."""
-    # Para servicios
-    service_id: Optional[str] = Field(default=None, description="El ID único del servicio encontrado.")
-    service_name: Optional[str] = Field(default=None, description="Nombre del servicio encontrado.")
+    """Modelo para el resultado de la búsqueda de conocimiento con validación estricta de tipos."""
+    # Para servicios - UUID validado
+    service_id: Optional[UUID] = Field(default=None, description="El ID único del servicio encontrado (debe ser UUID válido).")
+    service_name: Optional[str] = Field(default=None, min_length=1, description="Nombre del servicio encontrado.")
     requires_assessment: Optional[bool] = Field(default=None, description="Si el servicio requiere valoración previa.")
     
     # Para información general (archivos)
-    information_found: Optional[str] = Field(default=None, description="Información específica encontrada (ubicación, horarios, contacto, etc.)")
+    information_found: Optional[str] = Field(default=None, min_length=1, description="Información específica encontrada (ubicación, horarios, contacto, etc.)")
     source_type: Optional[str] = Field(default=None, description="Tipo de fuente: 'service' o 'file'")
     category: Optional[str] = Field(default=None, description="Categoría del archivo si es de tipo 'file'")
     
     # Para casos especiales
-    clarification_message: Optional[str] = Field(default=None, description="Mensaje para pedir aclaración al usuario si la búsqueda es ambigua o no arroja resultados.")
+    clarification_message: Optional[str] = Field(default=None, min_length=1, description="Mensaje para pedir aclaración al usuario si la búsqueda es ambigua o no arroja resultados.")
+    
+    @field_validator('source_type')
+    @classmethod
+    def validate_source_type(cls, v):
+        if v is not None and v not in ['service', 'file']:
+            raise ValueError("source_type debe ser 'service' o 'file'")
+        return v
+    
+    @field_validator('service_name', 'information_found', 'clarification_message')
+    @classmethod
+    def validate_non_empty_strings(cls, v):
+        if v is not None and (not isinstance(v, str) or len(v.strip()) == 0):
+            raise ValueError("El texto no puede estar vacío")
+        return v.strip() if isinstance(v, str) else v
 
 
 
@@ -174,10 +190,26 @@ class UserInsightsResult(BaseModel):
     insights_found: List[str] = Field(default_factory=list, description="Lista de insights/resúmenes encontrados.")
     summary: str = Field(description="Resumen de los insights encontrados.")
 
+# --- Función para forzar el uso de herramientas ---
+async def force_tool_usage(ctx: RunContext[GlobalState], tool_defs: List[ToolDefinition]) -> List[ToolDefinition]:
+    """
+    Función prepare_tools que fuerza el uso de herramientas.
+    Si no hay herramientas disponibles, no permite la ejecución.
+    """
+    if not tool_defs:
+        # Si no hay herramientas, algo está mal en la configuración
+        print("⚠️ WARNING: No hay herramientas disponibles para el agente")
+        return []
+    
+    print(f"🔧 TOOLS PREPARADOS: {len(tool_defs)} herramientas disponibles: {[t.name for t in tool_defs]}")
+    return tool_defs
+
 # --- Definición del Agente de Conocimiento ---
-knowledge_agent = Agent[GlobalState](
+knowledge_agent = Agent[GlobalState, KnowledgeSearchResult](
     'openai:gpt-4o', 
     deps_type=GlobalState,
+    output_type=KnowledgeSearchResult,  # ← FUERZA que el agente SIEMPRE devuelva KnowledgeSearchResult
+    prepare_tools=force_tool_usage,
     system_prompt="""
     Eres un asistente amigable y experto en servicios y productos de la empresa.
     Habla de manera natural y conversacional, como si fueras un asesor personal que conoce bien los servicios.
@@ -247,11 +279,15 @@ knowledge_agent = Agent[GlobalState](
     - NO uses asteriscos (**texto**) ni formato markdown para títulos
     - Escribe los nombres de servicios de forma natural, como en una conversación normal
     
-    🚨 OBLIGATORIO: SIEMPRE debes usar las herramientas disponibles para buscar información. NUNCA respondas directamente sin usar herramientas.
+    🎯 OBJETIVO: Ayudar al usuario encontrando información relevante usando las herramientas disponibles.
     
-    - Para CUALQUIER consulta sobre servicios, ubicación, horarios, precios → USA 'knowledge_search'
-    - Para preguntas sobre historial del usuario → USA las herramientas de búsqueda de usuario
-    - NO tengas conversaciones directas, SIEMPRE delega a las herramientas correspondientes
+    Para cualquier consulta:
+    1. Usa 'knowledge_search' para servicios, ubicación, horarios, precios
+    2. Usa 'search_user_facts' para historial del usuario  
+    3. Usa 'search_user_conversations' para conversaciones previas
+    4. Usa 'search_user_insights' para insights del usuario
+    
+    Siempre proporciona información útil y amigable en tu respuesta final.
     """
 )
 
@@ -351,7 +387,7 @@ async def knowledge_search(ctx: RunContext[GlobalState], query: str) -> Knowledg
                 return KnowledgeSearchResult(
                     information_found=content + suggestion,
                     source_type='service',
-                    service_id=list(unique_services.keys())[0]
+                    service_id=UUID(list(unique_services.keys())[0])
                 )
         
         if source_type == 'file':
@@ -431,7 +467,7 @@ async def knowledge_search(ctx: RunContext[GlobalState], query: str) -> Knowledg
             return KnowledgeSearchResult(
                 information_found=conversational_info,
                 source_type='service',
-                service_id=service_id
+                service_id=UUID(service_id)
             )
         
         else:
@@ -617,19 +653,26 @@ async def run_knowledge_agent(state: GlobalState) -> Command:
     # Construir query enriquecido con contexto de Zep
     if is_service_resolution and zep_context:
         # Cuando venimos del appointment_agent, extraer el servicio del contexto
-        enhanced_query = f"Buscar servicio específico mencionado en: {zep_context}"
+        # Usar un prompt MUY específico que solo pida identificación del servicio
+        enhanced_query = f"IDENTIFICAR SERVICIO: Encuentra únicamente el service_id del servicio mencionado en: {zep_context}. SOLO usa knowledge_search y retorna el resultado estructurado. NO generes texto conversacional."
         print(f"🔍 KNOWLEDGE AGENT: Query de resolución: {enhanced_query}")
     else:
         enhanced_query = user_query
         if zep_context:
             enhanced_query = f"Contexto del usuario: {zep_context}\n\nConsulta actual: {user_query}"
     
+    # FORZAR EL USO DE HERRAMIENTAS - Nunca responder directamente
+    # En Pydantic AI, forzamos el uso de herramientas via prepare_tools y validación
     result = await knowledge_agent.run(enhanced_query, deps=state)
     
-    # El resultado del agente puede ser de varios tipos, lo procesamos
+    # El resultado del agente es GARANTIZADO de ser KnowledgeSearchResult gracias a output_type
     tool_output = result.output
-    print(f"🔍 DEBUG: tool_output type: {type(tool_output)}")
-    print(f"🔍 DEBUG: tool_output value: {tool_output}")
+    print(f"✅ STRUCTURED OUTPUT: {type(tool_output)}")
+    print(f"🔍 DEBUG KnowledgeSearchResult:")
+    print(f"🔍 service_id: {tool_output.service_id}")
+    print(f"🔍 service_name: {tool_output.service_name}")
+    print(f"🔍 information_found: {bool(tool_output.information_found)}")
+    print(f"🔍 clarification_message: {bool(tool_output.clarification_message)}")
 
     # Obtener mensajes actuales para conservar el historial
     current_messages = state.get("messages", [])
@@ -655,7 +698,7 @@ async def run_knowledge_agent(state: GlobalState) -> Command:
             print(f"📋 KNOWLEDGE AGENT: PATH service_id - Actualizando estado con service_id: {tool_output.service_id}")
             
             result_data = {
-                "service_id": tool_output.service_id,
+                "service_id": str(tool_output.service_id),  # Convertir UUID a string para el estado
                 "messages": current_messages
             }
             if tool_output.requires_assessment is not None:
@@ -687,7 +730,7 @@ async def run_knowledge_agent(state: GlobalState) -> Command:
             # IMPORTANTE: Si es información de un servicio, también actualizar el service_id en el estado
             update_data = {"messages": current_messages + [ai_message]}
             if tool_output.service_id:
-                update_data["service_id"] = tool_output.service_id
+                update_data["service_id"] = str(tool_output.service_id)  # Convertir UUID a string para el estado
                 print(f"📋 KNOWLEDGE AGENT: Actualizando estado con service_id: {tool_output.service_id}")
                 print(f"📋 KNOWLEDGE AGENT: update_data completo: {update_data}")
             if tool_output.service_name:
