@@ -211,10 +211,13 @@ async def smart_tool_preparation(ctx: RunContext[GlobalState], tool_defs: List[T
     
     # 1. DETECTAR CAMBIO DE SERVICIO: Análisis contextual
     has_existing_service = state.get('service_id') is not None
+    # CRÍTICO: Solo si hay indicadores EXPLÍCITOS de cambio, no solo que haya un servicio
+    explicit_change_keywords = ["mejor", "cambio", "prefiero", "en lugar de", "no quiero", "diferente", "otro"]
     is_likely_service_change = (
         has_existing_service and 
         len(user_query.split()) >= 2 and  # Más de una palabra (sugiere especificidad)
-        user_query.strip() != ""  # No es mensaje vacío
+        user_query.strip() != "" and  # No es mensaje vacío
+        any(keyword in user_query.lower() for keyword in explicit_change_keywords)  # Indicadores de cambio
     )
     
     # 2. DETECTAR NECESIDAD DE HISTORIAL: Análisis semántico
@@ -263,9 +266,22 @@ knowledge_agent = Agent[GlobalState, KnowledgeSearchResult](
     output_type=KnowledgeSearchResult,  # ← FUERZA que el agente SIEMPRE devuelva KnowledgeSearchResult
     prepare_tools=smart_tool_preparation,
     system_prompt="""
-    Eres un asistente amigable y experto en servicios y productos de la empresa.
-    Habla de manera natural y conversacional, como si fueras un asesor personal que conoce bien los servicios.
-    Tu trabajo es ayudar al usuario a encontrar y seleccionar el servicio que desea, utilizando tanto la información actual como el historial del usuario.
+    🧠 ASISTENTE INTELIGENTE CON ANÁLISIS CONTEXTUAL
+
+    Eres un asistente experto que entiende las intenciones del usuario y responde apropiadamente.
+    
+    **REGLA CRÍTICA: MÁXIMO UNA BÚSQUEDA POR CONSULTA**
+    - Usa knowledge_search UNA SOLA VEZ por consulta del usuario
+    - Si la primera búsqueda no encuentra información relevante, NO hagas más búsquedas
+    - Si no encuentras información específica, ofrece conectar con un asesor
+    
+    **TU MISIÓN:**
+    - INFORMAR cuando el usuario solo quiere conocer sobre servicios
+    - PREPARAR PARA AGENDAR cuando el usuario tiene intención clara de reservar
+    
+    **ANÁLISIS DE INTENCIONES:**
+    1. **CONSULTA INFORMATIVA**: Solo quiere saber → Proporciona información, NO guardes service_id
+    2. **INTENCIÓN DE AGENDAR**: Quiere reservar → Busca servicio Y guarda service_id para siguiente paso
 
     HERRAMIENTAS DISPONIBLES:
     
@@ -326,9 +342,11 @@ knowledge_agent = Agent[GlobalState, KnowledgeSearchResult](
     🚨 REGLAS CRÍTICAS:
     - NUNCA INVENTES información que no encuentres en las herramientas
     - NO menciones servicios específicos a menos que la herramienta los devuelva explícitamente
-    - Si no encuentras información específica, pide clarificación o ofrece escalación
+    - MÁXIMO UNA BÚSQUEDA: Si knowledge_search no encuentra información relevante, NO busques de nuevo
+    - Si no encuentras información específica, explica amablemente y ofrece conectar con asesor
     - SOLO usa datos reales retornados por las herramientas de búsqueda
     - NO hagas suposiciones sobre qué servicios podrían existir
+    - NO reformules la búsqueda con sinónimos si la primera no fue exitosa
     
     📝 FORMATO DE RESPUESTAS:
     - Habla de manera natural y conversacional, evita listas técnicas
@@ -404,10 +422,42 @@ async def knowledge_search(ctx: RunContext[GlobalState], query: str) -> Knowledg
         print(f"🔍 Búsqueda amplia de servicios detectada: {is_broad_service_query}")
         
         # 🎯 UMBRAL DE SIMILARITY: Si la similarity es muy baja, no es información útil
-        if similarity < 0.1:  # Ajustar este valor según necesidades
+        if similarity < 0.1:
             return KnowledgeSearchResult(
-                clarification_message=f"No encontré información específica sobre '{query}'. ¿Podrías ser más específico sobre qué tipo de información necesitas? Por ejemplo: servicios, precios, ubicación, horarios, etc. Si prefieres, también puedo ayudarte a contactar con un asesor."
+                clarification_message=f"No encontré información específica sobre '{query}'. ¿Te gustaría que te conecte con un asesor para obtener información más detallada? 😊"
             )
+        
+        # 🧠 ANÁLISIS SEMÁNTICO INTELIGENTE: ¿La información encontrada realmente responde a la pregunta?
+        query_keywords = query.lower()
+        content_preview = best_result.get('content', '').lower()
+        
+        # Para consultas específicas, verificar que el contenido realmente contenga información relevante
+        specific_queries = {
+            'promocion': ['promocion', 'descuento', 'oferta', 'especial', '% off', 'rebaja'],
+            'precio': ['precio', 'costo', 'valor', '$', 'pesos', 'tarifa'],
+            'horario': ['horario', 'hora', 'atencion', 'abierto', 'cerrado', 'lunes', 'martes'],
+            'ubicacion': ['ubicacion', 'direccion', 'donde', 'lugar', 'encontrar'],
+            'contacto': ['telefono', 'celular', 'whatsapp', 'contacto', 'comunicar']
+        }
+        
+        # Detectar si es una consulta específica
+        specific_query_detected = None
+        for query_type, keywords in specific_queries.items():
+            if any(keyword in query_keywords for keyword in keywords):
+                specific_query_detected = query_type
+                break
+        
+        # Si es una consulta específica, verificar que el contenido la responda
+        if specific_query_detected:
+            relevant_keywords = specific_queries[specific_query_detected]
+            content_is_relevant = any(keyword in content_preview for keyword in relevant_keywords)
+            
+            # Si el contenido NO es relevante para la consulta específica
+            if not content_is_relevant and similarity < 0.6:  # Umbral más alto para consultas específicas
+                print(f"🚫 CONTENIDO NO RELEVANTE: Consulta sobre '{specific_query_detected}' pero contenido no contiene información relevante")
+                return KnowledgeSearchResult(
+                    clarification_message=f"No encontré información específica sobre {query} en nuestra base de datos. ¿Te gustaría que te conecte con un asesor que pueda ayudarte con esta consulta? 😊"
+                )
         
         # 📋 MANEJO ESPECIAL PARA BÚSQUEDAS AMPLIAS DE SERVICIOS
         if is_broad_service_query and source_type == 'service':
@@ -737,15 +787,16 @@ async def run_knowledge_agent(state: GlobalState) -> Command:
         # CONTEXTO: ¿Ya hay un servicio seleccionado?
         has_existing_service = state.get('service_id') is not None
         
-        # ANÁLISIS SEMÁNTICO: ¿El mensaje sugiere un cambio?
-        # Usamos análisis de contexto en lugar de palabras específicas
+        # ANÁLISIS SEMÁNTICO: ¿El mensaje sugiere un cambio REAL de servicio?
+        # Solo debe activarse si realmente es un cambio, no la primera búsqueda
         is_service_change_request = (
             has_existing_service and  # Ya hay un servicio en contexto
             len(user_query.split()) >= 2 and  # Mensaje con suficiente contenido
             user_query.strip() != "" and  # No está vacío
-            # Análisis adicional: si menciona servicios específicos o cambios
-            # (el LLM podrá interpretar mejor el contexto que nosotros hardcodeando)
-            True  # Permitir que el análisis contextual determine la necesidad
+            # CRÍTICO: Solo si hay indicadores EXPLÍCITOS de cambio
+            any(change_indicator in user_query.lower() for change_indicator in [
+                "mejor", "prefiero", "cambio", "en lugar de", "no quiero", "diferente", "otro"
+            ])
         )
         
         if is_service_change_request:
@@ -813,35 +864,48 @@ IMPORTANTE: Si en el historial mencioné servicios específicos y el usuario se 
                 goto="__end__"
             )
         elif tool_output.service_id:
-            # Si se encontró un servicio, incluir información de valoración si está disponible
-            # y enrutar al AppointmentAgent para posible agendamiento
-            print(f"📋 KNOWLEDGE AGENT: PATH service_id - Actualizando estado con service_id: {tool_output.service_id}")
+            # 🧠 ANÁLISIS INTELIGENTE: ¿El usuario quiere agendar o solo informarse?
+            user_wants_to_book = any(keyword in user_query.lower() for keyword in [
+                "agendar", "reservar", "programar", "cita", "gustaría agendar", "quiero agendar", "puedo agendar"
+            ])
             
-            result_data = {
-                "service_id": str(tool_output.service_id),  # Convertir UUID a string para el estado
-                "messages": current_messages
-            }
-            if tool_output.requires_assessment is not None:
-                result_data["requires_assessment"] = tool_output.requires_assessment
-            if tool_output.service_name:
-                result_data["service_name"] = tool_output.service_name
-                print(f"📋 KNOWLEDGE AGENT: PATH service_id - Actualizando estado con service_name: {tool_output.service_name}")
-            
-            print(f"📋 KNOWLEDGE AGENT: PATH service_id - result_data completo: {result_data}")
-            
-            # Si estamos en modo resolución, regresar directamente al AppointmentAgent
-            if is_service_resolution:
-                print(f"📋 KNOWLEDGE AGENT: Modo resolución - regresando a AppointmentAgent con service_id")
-                return Command(
-                    update=result_data,
-                    goto="AppointmentAgent"
-                )
+            if user_wants_to_book or is_service_resolution:
+                # CASO 1: USUARIO QUIERE AGENDAR → Guardar service_id en estado
+                print(f"🎯 KNOWLEDGE AGENT: Usuario quiere agendar → Guardando service_id: {tool_output.service_id}")
+                
+                result_data = {
+                    "service_id": str(tool_output.service_id),
+                    "messages": current_messages
+                }
+                if tool_output.requires_assessment is not None:
+                    result_data["requires_assessment"] = tool_output.requires_assessment
+                if tool_output.service_name:
+                    result_data["service_name"] = tool_output.service_name
+                    print(f"📋 KNOWLEDGE AGENT: Guardando service_name: {tool_output.service_name}")
+                
+                # Si estamos en modo resolución, ir directo a AppointmentAgent
+                if is_service_resolution:
+                    print(f"📋 KNOWLEDGE AGENT: Modo resolución → AppointmentAgent")
+                    return Command(update=result_data, goto="AppointmentAgent")
+                else:
+                    # Retornar al supervisor para continuar flujo de agendamiento
+                    print(f"📋 KNOWLEDGE AGENT: Preparado para agendar → Supervisor")
+                    return Command(update=result_data, goto="Supervisor")
+                    
             else:
-                # Retornar al supervisor para que decida si ir a AppointmentAgent
-                return Command(
-                    update=result_data,
-                    goto="Supervisor"
-                )
+                # CASO 2: SOLO CONSULTA INFORMATIVA → NO guardar service_id, solo responder
+                print(f"💡 KNOWLEDGE AGENT: Solo consulta informativa → Respondiendo sin guardar estado")
+                
+                if tool_output.information_found:
+                    from langchain_core.messages import AIMessage
+                    ai_message = AIMessage(content=tool_output.information_found, name="KnowledgeAgent")
+                    return Command(
+                        update={"messages": current_messages + [ai_message]},
+                        goto="__end__"
+                    )
+                else:
+                    # Si por alguna razón no hay información, ir al supervisor
+                    return Command(goto="Supervisor")
         elif tool_output.information_found:
             # Si se encontró información general (archivos o servicios), devolverla directamente y terminar
             from langchain_core.messages import AIMessage

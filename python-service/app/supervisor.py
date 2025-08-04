@@ -32,18 +32,12 @@ class SupervisorOutput(BaseModel):
 # 3. Creamos la función del nodo supervisor que se usará en el grafo
 async def supervisor_node(state: GlobalState) -> Command[Literal[*AGENT_NAMES, "__end__"]]:
     """
-    Este nodo orquesta el flujo de trabajo. Analiza el mensaje más reciente del usuario
-    y decide qué hacer a continuación, utilizando el historial como contexto.
+    Supervisor inteligente con análisis contextual avanzado.
+    Usa context-aware decision making para routing inteligente.
     """
-    print("--- Supervisor ---")
+    print("--- Supervisor Inteligente ---")
     
-    # DEBUG: Mostrar el estado que recibe el supervisor
-    print(f"🔍 DEBUG Supervisor recibiendo estado:")
-    print(f"🔍 service_id: {state.get('service_id')}")
-    print(f"🔍 service_name: {state.get('service_name')}")
-    print(f"🔍 organization_id: {state.get('organization_id')}")
-
-    # --- 1. Extraer el último mensaje del usuario Y verificar si hay respuesta de agente ---
+    # --- 1. EXTRAER CONTEXTO COMPLETO ---
     latest_user_message = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
     latest_ai_message = next((m for m in reversed(state["messages"]) if isinstance(m, AIMessage)), None)
 
@@ -51,28 +45,24 @@ async def supervisor_node(state: GlobalState) -> Command[Literal[*AGENT_NAMES, "
         print("⚠️ No se encontró un mensaje de usuario para procesar. Terminando.")
         return Command(goto="__end__")
     
-    # --- DETECTAR SI VENIMOS DE UN AGENTE QUE YA ACTUALIZÓ EL ESTADO ---
-    # Si el último mensaje AI es más reciente que el último mensaje del usuario,
-    # significa que un agente ya respondió y debemos considerar el contexto actualizado
+    # --- 2. ANÁLISIS INTELIGENTE DE CONTEXTO ---
+    current_service_id = state.get('service_id')
+    current_service_name = state.get('service_name')
+    user_query = latest_user_message.content
+    
+    print(f"🧠 CONTEXTO ACTUAL:")
+    print(f"   - service_id: {current_service_id}")
+    print(f"   - service_name: {current_service_name}")
+    print(f"   - Usuario dice: '{user_query}'")
+    
+    # --- 3. DETECCIÓN DE FLUJO COMPLETADO ---
+    # Si hay una respuesta AI más reciente que el mensaje del usuario, la conversación está completa
     if (latest_ai_message and 
         latest_user_message and 
         state["messages"].index(latest_ai_message) > state["messages"].index(latest_user_message)):
         
-        print("🔄 DETECTADO: Regresando de un agente que ya procesó la solicitud")
-        print(f"🔄 Último mensaje AI: {latest_ai_message.name} - {latest_ai_message.content[:100]}...")
-        
-        # Si el KnowledgeAgent ya resolvió un servicio y hay service_id, ir directo a AppointmentAgent
-        if (latest_ai_message.name == "KnowledgeAgent" and 
-            state.get('service_id') and 
-            any(keyword in latest_user_message.content.lower() for keyword in ["agendar", "reservar", "programar", "cita"])):
-            
-            print("🔄 KnowledgeAgent resolvió servicio + usuario quiere reservar → AppointmentAgent")
-            return Command(goto="AppointmentAgent")
-        
-        # Si cualquier agente ya terminó su tarea, terminar
-        elif latest_ai_message.name in ["KnowledgeAgent", "AppointmentAgent", "EscalationAgent"]:
-            print("🔄 Agente ya completó la tarea → Terminando")
-            return Command(goto="__end__")
+        print("✅ Conversación completada por un agente → Terminando")
+        return Command(goto="__end__")
 
     # --- 2. Preparar el contexto para el LLM ---
     history_messages = state["messages"][:-1]
@@ -88,35 +78,54 @@ async def supervisor_node(state: GlobalState) -> Command[Literal[*AGENT_NAMES, "
         except Exception as e:
             print(f"⚠️ No se pudo obtener contexto de Zep para thread {thread_id}. Error: {e}")
 
-    # --- 3. Construir el Prompt para el Supervisor ---
-    system_prompt = f"""Eres un asistente virtual experto de la empresa. Tu única función es analizar el MENSAJE MÁS RECIENTE del usuario y decidir el siguiente paso.
+    # --- 3. Construir el Prompt Inteligente para el Supervisor ---
+    system_prompt = f"""🧠 SUPERVISOR INTELIGENTE CON ANÁLISIS CONTEXTUAL AVANZADO
 
-    **Contexto de la Conversación (Mensajes Anteriores):**
-    {history_str}
+**TU MISIÓN:** Analizar la intención REAL del usuario y tomar la decisión MÁS INTELIGENTE sobre el próximo paso.
 
-    **Memoria a Largo Plazo (Datos del Cliente):**
-    {zep_context}
+**CONTEXTO ACTUAL:**
+- Estado del servicio: {"🎯 SERVICIO IDENTIFICADO (" + str(current_service_name) + ")" if current_service_id else "❌ SIN SERVICIO"}
+- Service ID: {current_service_id or "None"}
 
-    **INSTRUCCIONES CRÍTICAS:**
-    1.  Tu foco principal es el **"MENSAJE DEL USUARIO A PROCESAR"**.
-    2.  Usa el contexto y la memoria SÓLO para entender la intención del mensaje actual.
-    3.  **NO respondas a mensajes antiguos.** Tu tarea es actuar sobre el último input.
-    4.  Sé decisivo y claro en tu enrutamiento.
+**HISTORIAL DE LA CONVERSACIÓN:**
+{history_str}
 
-    **Estado Actual:**
-    - Service ID en estado: {state.get('service_id')}
-    - Service Name en estado: {state.get('service_name')}
+**MEMORIA DEL USUARIO:**
+{zep_context or "Sin información previa"}
 
-    **Reglas de Enrutamiento:**
-    -   Para saludos, despedidas o charla casual: responde directamente y termina (`terminate`).
-    -   Para consultas **VAGAS** (ej: "info", "ayuda"): responde pidiendo más detalles y termina (`terminate`).
-    -   Para preguntas **ESPECÍFICAS** sobre servicios, precios, ubicación, horarios: enruta a `KnowledgeAgent`.
-    -   Si un usuario quiere **reservar/agendar/programar** algo:
-        -   Si NO hay service_id en estado O el usuario menciona un servicio específico diferente al actual: enruta a `KnowledgeAgent` PRIMERO.
-        -   Si YA hay service_id y el usuario solo quiere continuar con la reserva: enruta a `AppointmentAgent`.
-    -   Si el usuario pide explícitamente hablar con un **humano/asesor**: enruta a `EscalationAgent`.
-    -   Si el mensaje del usuario es una simple confirmación (ej: "ok", "listo") y la tarea anterior ya se completó: responde amablemente y termina (`terminate`).
-    """
+**🎯 ANÁLISIS INTELIGENTE DE INTENCIONES:**
+
+1. **INFORMACIÓN GENERAL/EXPLORATORIA**: 
+   - "¿Qué servicios tienen?", "¿Qué ofrecen?", "Cuéntame sobre sus servicios"
+   → `KnowledgeAgent` (NO guardar service_id, solo informar)
+
+2. **INFORMACIÓN ESPECÍFICA DE UN SERVICIO**: 
+   - "¿Cuánto cuesta la limpieza facial?", "¿En qué consiste el masaje?"
+   → `KnowledgeAgent` (puede obtener service_id para contexto futuro, pero SIN compromiso de agendar)
+
+3. **INTENCIÓN CLARA DE AGENDAR**:
+   - "Quiero agendar...", "Me gustaría reservar...", "¿Puedo programar...?"
+   - Si YA hay service_id: → `AppointmentAgent` (directo al agendamiento)
+   - Si NO hay service_id: → `KnowledgeAgent` (identificar servicio primero, LUEGO agendar)
+
+4. **CAMBIO DE TEMA/SERVICIO**: 
+   - Si pregunta por OTRO servicio diferente al actual
+   → `KnowledgeAgent` (buscar nuevo servicio, solo guardar ID si va a agendar)
+
+5. **ESCALACIÓN**: 
+   - "Quiero hablar con alguien", "¿Hay un asesor disponible?"
+   → `EscalationAgent`
+
+6. **CONVERSACIÓN CASUAL**: 
+   - Saludos, despedidas, agradecimientos, confirmaciones simples
+   → `terminate` (responde directamente y amablemente)
+
+**REGLAS DE ORO**: 
+- Service_id se guarda SOLO cuando hay intención CLARA de agendar
+- Para consultas puramente informativas, NO es necesario guardar service_id
+- Analiza la INTENCIÓN REAL del usuario, no solo palabras clave
+- Un usuario puede preguntar sobre múltiples servicios sin querer agendar ninguno
+- Solo cuando dice "quiero agendar X" es que necesita el service_id guardado"""
     
     user_input_for_llm = f"""
     **MENSAJE DEL USUARIO A PROCESAR:**
