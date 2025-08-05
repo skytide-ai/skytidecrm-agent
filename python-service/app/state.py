@@ -20,4 +20,8 @@ class GlobalState(TypedDict):
     available_slots: Optional[list] = None
     appointment_date_query: Optional[str] = None
     focused_appointment: Optional[dict] = None # Para guardar la cita que se está discutiendo
+    ready_to_book: Optional[bool] = None # Bandera para indicar que está listo para agendar
+    selected_date: Optional[str] = None # Fecha seleccionada para el agendamiento (YYYY-MM-DD)
+    selected_time: Optional[str] = None # Hora seleccionada para el agendamiento (HH:MM)
+    selected_member_id: Optional[str] = None # ID del miembro para el horario seleccionado
     next_agent: Optional[str] = None 

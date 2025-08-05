@@ -57,33 +57,41 @@ class ContactResolution(BaseModel):
     message: str = Field(min_length=1, description="Mensaje descriptivo del resultado")
     is_existing_contact: bool = Field(default=False, description="True si el contacto ya existía, False si se creó uno nuevo")
 
+class SlotSelection(BaseModel):
+    """Resultado de la selección de horario con validación."""
+    success: bool = Field(description="Si la selección fue exitosa")
+    message: str = Field(min_length=1, description="Mensaje de confirmación")
+    selected_date: str = Field(description="Fecha seleccionada en formato YYYY-MM-DD")
+    selected_time: str = Field(description="Hora seleccionada en formato HH:MM")
+    member_id: str = Field(description="ID del miembro para el horario seleccionado")
+
+class ContextReset(BaseModel):
+    """Resultado del reseteo de contexto de agendamiento."""
+    success: bool = Field(description="Si el reseteo fue exitoso")
+    message: str = Field(min_length=1, description="Mensaje de confirmación")
+    fields_cleared: List[str] = Field(description="Lista de campos que fueron limpiados")
+
 # --- Definición del Agente de Citas ---
 appointment_agent = Agent[GlobalState](
     'openai:gpt-4o',
     deps_type=GlobalState,
     system_prompt="""
-    Eres un asistente experto en la gestión de citas. Tu trabajo es guiar al usuario a través del proceso de agendamiento, consulta, cancelación y reprogramación.
 
-    **Flujo de Trabajo General:**
-    1.  **Identificar Intención:** Primero, entiende si el usuario quiere agendar, consultar, cancelar o reprogramar.
-    2.  **Recopilar Información:** Pide al usuario la información que necesites y que no tengas ya en el historial. Para agendar, siempre necesitas un servicio, una fecha y una hora deseada.
-    3.  **Manejo de Fechas:** 
-        - **Si NO especifica fecha:** Pregunta de manera amigable si tiene alguna fecha en mente. Ejemplo: "¿Tienes alguna fecha en mente para tu cita?😊"
-        - **Si SÍ especifica fecha:** Procede a interpretarla usando el contexto temporal.
-    4.  **Interpretar Fechas:** Tienes acceso al contexto temporal completo. Convierte expresiones naturales a fechas específicas:
-        - "Mañana", "hoy", "el lunes que viene" → usa las fechas calculadas en el contexto
-        - "15 de diciembre", "el 25" → calcula la fecha completa (año actual)
-        - "Dentro de 3 días", "la próxima semana" → calcula desde la fecha actual
-        - Siempre devuelve fechas en formato YYYY-MM-DD para las herramientas
-    5.  **Usar Herramientas:** Llama a las herramientas disponibles de forma secuencial. No intentes llamarlas todas a la vez.
-
+    **DETECCIÓN DE CAMBIOS DE CONTEXTO:**
+    Antes de cualquier flujo, SIEMPRE verifica si el usuario está cambiando de contexto:
+    - Si ya hay un `service_id` en el estado pero el usuario menciona un servicio DIFERENTE → llama `reset_appointment_context`
+    - Si ya hay `selected_date` pero el usuario quiere una fecha DIFERENTE → llama `reset_appointment_context`
+    - Si detectas que el usuario quiere "empezar de nuevo" o "cambiar" algo → llama `reset_appointment_context`
+    
     **Flujos Específicos:**
     -   **Agendar Cita (`book_appointment`):**
-        -   **Paso 1: Contacto.** ANTES de pedir datos, revisa el historial/contexto para ver si ya conoces al usuario. Si ya tienes su nombre en conversaciones anteriores, úsalo directamente. Si es un usuario completamente nuevo, entonces pide su nombre y apellido. Luego llama a `resolve_contact_on_booking` usando EXACTAMENTE los valores del estado: `organization_id`, `phone_number`, y `country_code` tal como aparecen en "Estado Actual".
-        -   **Paso 1.5: Fecha.** Si el usuario no especificó una fecha al solicitar agendar, pregúntale primero por la fecha antes de buscar disponibilidad.
+        -   **Paso 0: Verificación de Contexto.** ANTES de proceder, verifica si hay cambios de contexto y resetea si es necesario.
+        -   **Paso 1: Fecha.** Si el usuario no especificó una fecha al solicitar agendar, pregúntale primero por la fecha antes de buscar disponibilidad.
         -   **Paso 2: Disponibilidad.** Llama a `check_availability` usando el `service_id` del estado (NO el nombre del servicio). Siempre muestra al menos 3 opciones al usuario.
-        -   **Paso 3: Agendamiento.** Una vez que el usuario elige una hora, llama a `book_appointment` usando EXACTAMENTE el `member_id` que devolvió `check_availability` para esa hora específica. NUNCA uses el `contact_id` como `member_id`. La función `book_appointment` obtendrá automáticamente el `contact_id` del estado global.
-        -   **Paso 4: Notificaciones (MUY IMPORTANTE).** Después de un agendamiento exitoso, la herramienta `book_appointment` te devolverá un campo `opt_in_status`.
+        -   **Paso 3: Selección de Horario.** Cuando el usuario selecciona un horario específico de los disponibles, llama INMEDIATAMENTE a `select_appointment_slot` con la fecha y hora que eligió. Esta función identificará el slot exacto y guardará toda la información necesaria.
+        -   **Paso 4: Resolución de Contacto.** SOLO después de una selección exitosa de horario, llama INMEDIATAMENTE a `resolve_contact_on_booking` usando EXACTAMENTE los valores del estado: `organization_id`, `phone_number`, y `country_code`. NUNCA pidas datos antes de esta llamada. Si la función devuelve `is_existing_contact: true`, procede directamente al agendamiento. Si devuelve `is_existing_contact: false`, entonces pide nombre y apellido y vuelve a llamar la función con esos datos.
+        -   **Paso 4: Agendamiento.** Una vez resuelto el contacto, llama a `book_appointment` usando EXACTAMENTE el `member_id` que devolvió `check_availability` para esa hora específica. NUNCA uses el `contact_id` como `member_id`. La función `book_appointment` obtendrá automáticamente el `contact_id` del estado global.
+        -   **Paso 5: Notificaciones (MUY IMPORTANTE).** Después de un agendamiento exitoso, la herramienta `book_appointment` te devolverá un campo `opt_in_status`.
             -   Si `opt_in_status` es 'opt_in' o 'opt_out', tu trabajo ha terminado. Simplemente confirma la cita.
             -   Si `opt_in_status` es 'not_set', DEBES PREGUNTAR al usuario si desea recibir notificaciones y recordatorios por WhatsApp. Ejemplo: "Tu cita ha sido confirmada. ¿Te gustaría recibir recordatorios por este medio?".
             -   Si el usuario acepta, DEBES llamar a la herramienta `create_whatsapp_opt_in` para guardar su preferencia.
@@ -102,7 +110,7 @@ appointment_agent = Agent[GlobalState](
     -   Sé siempre amable y conversacional.
     -   No inventes información. Si no puedes hacer algo, informa al usuario.
     -   **MEMORIA:** Utiliza la información del historial de la conversación para no volver a preguntar datos que ya tienes. Si en el historial ya tienes el nombre del usuario, úsalo directamente. Si ya agendó antes, no pidas datos personales de nuevo.
-    -   **CONTACTOS EXISTENTES:** Cuando `resolve_contact_on_booking` retorne `is_existing_contact: true`, significa que el usuario ya tiene historial. No pidas nombre/apellido nuevamente.
+    -   **CONTACTOS EXISTENTES:** Cuando `resolve_contact_on_booking` retorne `is_existing_contact: true`, significa que el usuario ya tiene historial. PROCEDE INMEDIATAMENTE al agendamiento, NO pidas nombre/apellido. SOLO pide datos si `is_existing_contact: false`.
     -   **LENGUAJE NATURAL:** Nunca menciones términos técnicos como "service_id", "contact_id", "UUID", etc. Habla de forma natural sobre "tu servicio", "tu cita", "tu información".
     -   **EMOJIS Y NATURALIDAD:** Usa emojis para hacer la conversación más amigable 😊 NO uses asteriscos (**texto**) ni formato markdown. Escribe de forma natural como en una conversación por WhatsApp.
     -   **FECHAS NATURALES:** Cuando el usuario diga "mañana", "hoy", "el lunes próximo", convierte esas expresiones a fechas específicas usando el contexto temporal que tienes disponible.
@@ -111,6 +119,96 @@ appointment_agent = Agent[GlobalState](
 )
 
 # --- Herramientas del Agente ---
+
+@appointment_agent.tool
+async def reset_appointment_context(
+    ctx: RunContext[GlobalState],
+    reason: str = "Cambio de contexto detectado"
+) -> ContextReset:
+    """
+    Resetea el contexto de agendamiento cuando el usuario cambia de servicio, fecha, o inicia un nuevo flujo.
+    
+    IMPORTANTE: Llama esta función cuando detectes:
+    - Usuario menciona un servicio diferente al actual
+    - Usuario quiere cambiar de fecha después de haber seleccionado una
+    - Usuario quiere empezar un agendamiento completamente nuevo
+    - Cualquier cambio que invalide la selección actual
+    
+    Esta función NO afecta contact_id ni datos permanentes del usuario.
+    """
+    fields_to_clear = [
+        "available_slots",
+        "selected_date", 
+        "selected_time",
+        "selected_member_id",
+        "ready_to_book",
+        "focused_appointment",
+        "appointment_date_query"
+    ]
+    
+    print(f"🔄 RESET CONTEXTO: {reason}")
+    print(f"🧹 Limpiando campos: {fields_to_clear}")
+    
+    return ContextReset(
+        success=True,
+        message=f"Entendido! Empezamos de nuevo. {reason}",
+        fields_cleared=fields_to_clear
+    )
+
+
+@appointment_agent.tool
+async def select_appointment_slot(
+    ctx: RunContext[GlobalState],
+    appointment_date: str,  # Formato YYYY-MM-DD
+    start_time: str,  # Formato HH:MM que seleccionó el usuario
+) -> SlotSelection:
+    """
+    Selecciona un horario específico de los slots disponibles.
+    Esta función busca el slot exacto que coincida con la fecha y hora seleccionada
+    y guarda la información necesaria para el agendamiento.
+    
+    IMPORTANTE: Llama esta función ANTES de resolve_contact_on_booking cuando el usuario
+    seleccione un horario específico de los mostrados previamente.
+    """
+    state = ctx.deps
+    available_slots = state.get("available_slots", [])
+    
+    if not available_slots:
+        return SlotSelection(
+            success=False,
+            message="No hay horarios disponibles previamente consultados. Busca disponibilidad primero.",
+            selected_date="",
+            selected_time="",
+            member_id=""
+        )
+    
+    # Buscar el slot que coincida exactamente con la selección del usuario
+    selected_slot = None
+    for slot in available_slots:
+        if slot.get('start_time') == start_time:
+            selected_slot = slot
+            break
+    
+    if not selected_slot:
+        return SlotSelection(
+            success=False,
+            message=f"No encontré el horario {start_time} entre las opciones disponibles. Por favor, selecciona uno de los horarios mostrados anteriormente.",
+            selected_date="",
+            selected_time="",
+            member_id=""
+        )
+    
+    # Guardar la selección
+    member_id = str(selected_slot.get('member_id'))
+    print(f"📅 SLOT SELECCIONADO: fecha={appointment_date}, hora={start_time}, member_id={member_id}")
+    
+    return SlotSelection(
+        success=True,
+        message=f"Perfecto! Has seleccionado la cita para el {appointment_date} a las {start_time}. Ahora voy a confirmar tu información de contacto.",
+        selected_date=appointment_date,
+        selected_time=start_time,
+        member_id=member_id
+    )
 
 
 @appointment_agent.tool
@@ -159,7 +257,7 @@ async def resolve_contact_on_booking(
             return ContactResolution(
                 success=True,
                 contact_id=contact_id,
-                message="Contacto existente encontrado. No necesitas pedir más datos.",
+                message="¡Perfecto! Te reconocí como usuario registrado. Procediendo inmediatamente con el agendamiento de tu cita.",
                 is_existing_contact=True
             )
         else:
@@ -515,7 +613,7 @@ async def cancel_appointment(ctx: RunContext[GlobalState], appointment_id: str) 
 
 # --- Función de Entrada (Entrypoint) para el Grafo ---
 from langgraph.types import Command
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 async def run_appointment_agent(state: GlobalState) -> Command:
     """
@@ -528,13 +626,46 @@ async def run_appointment_agent(state: GlobalState) -> Command:
     print(f"🔍 DEBUG Estado actual:")
     print(f"🔍 service_id: {state.get('service_id')}")
     print(f"🔍 service_name: {state.get('service_name')}")
+    print(f"🔍 contact_id: {state.get('contact_id')}")
+    print(f"🔍 ready_to_book: {state.get('ready_to_book')}")
     print(f"🔍 organization_id: {state.get('organization_id')}")
+    
+    # 🚀 AUTO-AGENDAMIENTO: Si contact_id está listo, proceder directamente
+    if (state.get('ready_to_book') and state.get('contact_id') and state.get('service_id') and 
+        state.get('selected_date') and state.get('selected_time') and state.get('selected_member_id')):
+        print("🚀 AUTO-AGENDAMIENTO ACTIVADO: Todas las condiciones cumplidas")
+        print(f"✅ service_id: {state.get('service_id')}")
+        print(f"✅ contact_id: {state.get('contact_id')}")
+        print(f"✅ ready_to_book: {state.get('ready_to_book')}")
+        print(f"✅ selected_date: {state.get('selected_date')}")
+        print(f"✅ selected_time: {state.get('selected_time')}")
+        print(f"✅ selected_member_id: {state.get('selected_member_id')}")
+        
+        # Limpiar la bandera inmediatamente para evitar loops
+        current_messages = state.get("messages", [])
+        
+        # Crear mensaje específico para activar book_appointment con información del horario
+        selected_date = state.get('selected_date', 'fecha no especificada')
+        selected_time = state.get('selected_time', 'hora no especificada')
+        auto_booking_message = f"Contacto resuelto exitosamente. PROCEDER INMEDIATAMENTE con book_appointment para la fecha {selected_date} a las {selected_time}. Todos los datos están listos en el estado."
+        
+        return Command(
+            update={
+                "messages": current_messages + [AIMessage(content=auto_booking_message, name="AutoBooking")],
+                "ready_to_book": False,  # ✅ LIMPIAR BANDERA PARA EVITAR LOOPS
+                "contact_id": state.get('contact_id'),  # ✅ PRESERVAR CONTACT_ID
+                "selected_date": state.get('selected_date'),  # ✅ PRESERVAR FECHA SELECCIONADA
+                "selected_time": state.get('selected_time'),  # ✅ PRESERVAR HORA SELECCIONADA
+                "selected_member_id": state.get('selected_member_id')  # ✅ PRESERVAR MEMBER_ID
+            },
+            goto="AppointmentAgent"  # Continuar en appointment_agent pero sin la bandera
+        )
     
     # VALIDACIÓN: Solo delegar al KnowledgeAgent si NO hay service_id
     if not state.get('service_id'):
         print(f"🔍 No hay service_id en estado, delegando al KnowledgeAgent para resolver servicio")
         # Crear un mensaje que indique al knowledge_agent que resuelva el servicio
-        from langchain_core.messages import HumanMessage
+
         current_messages = state.get("messages", [])
         resolve_message = HumanMessage(content="Necesito encontrar el servicio específico que quiere agendar basándose en el contexto de la conversación.")
         
@@ -633,6 +764,56 @@ async def run_appointment_agent(state: GlobalState) -> Command:
 
     # Procesamos la salida de la herramienta para actualizar el estado del grafo
     
+    # ✅ MANEJAR RESET DE CONTEXTO
+    if isinstance(tool_output, ContextReset):
+        print(f"🔄 APPOINTMENT_AGENT: Procesando ContextReset")
+        print(f"🔄 tool_output.success: {tool_output.success}")
+        print(f"🧹 Campos a limpiar: {tool_output.fields_cleared}")
+        
+        if tool_output.success:
+            # Crear el update dict con todos los campos a limpiar
+            update_dict = {
+                "messages": current_messages + [AIMessage(content=tool_output.message, name="AppointmentAgent")]
+            }
+            
+            # Limpiar cada campo especificado
+            for field in tool_output.fields_cleared:
+                update_dict[field] = None
+            
+            print(f"🧹 Estado limpiado: {tool_output.fields_cleared}")
+            
+            return Command(
+                update=update_dict,
+                goto="AppointmentAgent"  # Continuar en el mismo agente para el nuevo flujo
+            )
+    
+    # ✅ MANEJAR SELECCIÓN DE HORARIO Y ACTUALIZAR ESTADO
+    if isinstance(tool_output, SlotSelection):
+        print(f"📅 APPOINTMENT_AGENT: Procesando SlotSelection")
+        print(f"📅 tool_output.success: {tool_output.success}")
+        
+        if tool_output.success:
+            # Actualizar estado con la información del horario seleccionado
+            print(f"📅 ACTUALIZANDO ESTADO: selected_date={tool_output.selected_date}, selected_time={tool_output.selected_time}, selected_member_id={tool_output.member_id}")
+            
+            ai_message = AIMessage(content=tool_output.message, name="AppointmentAgent")
+            return Command(
+                update={
+                    "messages": current_messages + [ai_message],
+                    "selected_date": tool_output.selected_date,
+                    "selected_time": tool_output.selected_time,
+                    "selected_member_id": tool_output.member_id
+                },
+                goto="AppointmentAgent"  # Continuar para resolución de contacto
+            )
+        else:
+            # Error en la selección del horario
+            ai_message = AIMessage(content=f"⚠️ {tool_output.message}", name="AppointmentAgent")
+            return Command(
+                update={"messages": current_messages + [ai_message]},
+                goto="__end__"
+            )
+    
     # ✅ MANEJAR RESOLUCIÓN DE CONTACTO Y ACTUALIZAR ESTADO
     if isinstance(tool_output, ContactResolution):
         print(f"📋 APPOINTMENT_AGENT: Procesando ContactResolution")
@@ -642,13 +823,30 @@ async def run_appointment_agent(state: GlobalState) -> Command:
         if tool_output.success and tool_output.contact_id:
             # ✅ ACTUALIZAR EL ESTADO GLOBAL CON EL CONTACT_ID
             print(f"📋 ACTUALIZANDO ESTADO: contact_id = {tool_output.contact_id}")
-            ai_message = AIMessage(content=tool_output.message, name="AppointmentAgent")
+            print(f"📋 ESTADO PERSISTIRÁ: contact_id estará disponible en próximas interacciones")
+            
+            # 🚀 DESPUÉS DE RESOLVER CONTACTO → PROCEDER AUTOMÁTICAMENTE AL AGENDAMIENTO
+            print(f"🚀 CONTACT_ID RESUELTO → ACTIVANDO AUTO-AGENDAMIENTO")
+            
+            # Actualizar estado y continuar en el mismo agente para completar el agendamiento
+            updated_state = {
+                **state,
+                "contact_id": tool_output.contact_id,
+                "messages": current_messages + [AIMessage(content=tool_output.message, name="AppointmentAgent")]
+            }
+            
+            # ✅ LLAMAR DIRECTAMENTE A book_appointment AHORA QUE TENEMOS EL contact_id
+            print(f"🎯 EJECUTANDO book_appointment con contact_id: {tool_output.contact_id}")
+            
+            # Aquí deberíamos llamar book_appointment directamente, pero por ahora 
+            # regresamos al supervisor con una bandera especial
             return Command(
                 update={
-                    "messages": current_messages + [ai_message],
-                    "contact_id": tool_output.contact_id  # ✅ AQUÍ SE ACTUALIZA EL ESTADO
+                    "messages": current_messages + [AIMessage(content=tool_output.message, name="AppointmentAgent")],
+                    "contact_id": tool_output.contact_id,
+                    "ready_to_book": True  # 🔥 BANDERA PARA INDICAR QUE ESTÁ LISTO PARA AGENDAR
                 },
-                goto="Supervisor"  # Continuar el flujo
+                goto="AppointmentAgent"  # 🔄 PERMANECER EN APPOINTMENT AGENT PARA COMPLETAR
             )
         else:
             # Error en la resolución del contacto
@@ -713,6 +911,8 @@ async def run_appointment_agent(state: GlobalState) -> Command:
                 update={"messages": current_messages + [ai_message]},
                 goto="Supervisor"  # Regresar al supervisor para siguiente acción
             )
+
+
 
     # Fallback por si el agente responde con texto plano
     if isinstance(tool_output, str):

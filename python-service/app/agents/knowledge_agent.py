@@ -873,10 +873,27 @@ IMPORTANTE: Si en el historial mencioné servicios específicos y el usuario se 
                 # CASO 1: USUARIO QUIERE AGENDAR → Guardar service_id en estado
                 print(f"🎯 KNOWLEDGE AGENT: Usuario quiere agendar → Guardando service_id: {tool_output.service_id}")
                 
+                # ✅ LIMPIAR CONTEXTO DE AGENDAMIENTO SI HAY CAMBIO DE SERVICIO
+                current_service_id = state.get('service_id')
+                service_changed = current_service_id and current_service_id != str(tool_output.service_id)
+                
                 result_data = {
                     "service_id": str(tool_output.service_id),
                     "messages": current_messages
                 }
+                
+                # Si el servicio cambió, limpiar contexto de agendamiento
+                if service_changed:
+                    print(f"🔄 KNOWLEDGE AGENT: Servicio cambió de {current_service_id} a {tool_output.service_id} → Limpiando contexto")
+                    result_data.update({
+                        "available_slots": None,
+                        "selected_date": None,
+                        "selected_time": None,
+                        "selected_member_id": None,
+                        "ready_to_book": None,
+                        "focused_appointment": None,
+                        "appointment_date_query": None
+                    })
                 if tool_output.requires_assessment is not None:
                     result_data["requires_assessment"] = tool_output.requires_assessment
                 if tool_output.service_name:
@@ -914,8 +931,26 @@ IMPORTANTE: Si en el historial mencioné servicios específicos y el usuario se 
             # IMPORTANTE: Si es información de un servicio, también actualizar el service_id en el estado
             update_data = {"messages": current_messages + [ai_message]}
             if tool_output.service_id:
+                # ✅ LIMPIAR CONTEXTO DE AGENDAMIENTO SI HAY CAMBIO DE SERVICIO
+                current_service_id = state.get('service_id')
+                service_changed = current_service_id and current_service_id != str(tool_output.service_id)
+                
                 update_data["service_id"] = str(tool_output.service_id)  # Convertir UUID a string para el estado
                 print(f"📋 KNOWLEDGE AGENT: Actualizando estado con service_id: {tool_output.service_id}")
+                
+                # Si el servicio cambió, limpiar contexto de agendamiento
+                if service_changed:
+                    print(f"🔄 KNOWLEDGE AGENT: Servicio cambió de {current_service_id} a {tool_output.service_id} → Limpiando contexto")
+                    update_data.update({
+                        "available_slots": None,
+                        "selected_date": None,
+                        "selected_time": None,
+                        "selected_member_id": None,
+                        "ready_to_book": None,
+                        "focused_appointment": None,
+                        "appointment_date_query": None
+                    })
+                
                 print(f"📋 KNOWLEDGE AGENT: update_data completo: {update_data}")
             if tool_output.service_name:
                 update_data["service_name"] = tool_output.service_name
