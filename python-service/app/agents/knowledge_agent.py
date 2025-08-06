@@ -19,24 +19,26 @@ async def generate_embedding(text: str) -> List[float]:
         print(f"❌ Error generando embedding: {e}")
         return []
 
-async def search_knowledge_semantic(query: str, organization_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+async def search_knowledge_semantic(query: str, organization_id: str, service_id: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
     try:
         query_embedding = await generate_embedding(query)
         if not query_embedding:
             return []
         
+        rpc_params = {
+            'query_embedding': query_embedding,
+            'match_threshold': 0.2,
+            'match_count': limit,
+            'org_id': organization_id,
+            'p_service_id': service_id  # CORREGIDO: Usar el nombre de parámetro correcto
+        }
+        
+        print(f"🔍 Parámetros RPC: org_id={organization_id}, p_service_id={service_id}")
+
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None, 
-            lambda: supabase_client.rpc(
-                'match_documents_by_org',
-                {
-                    'query_embedding': query_embedding,
-                    'match_threshold': 0.2,
-                    'match_count': limit,
-                    'org_id': organization_id
-                }
-            ).execute()
+            lambda: supabase_client.rpc('match_documents_by_org', rpc_params).execute()
         )
         return result.data if result.data else []
     except Exception as e:
@@ -62,14 +64,12 @@ knowledge_agent = Agent[GlobalState, KnowledgeSearchResult](
     deps_type=GlobalState,
     output_type=KnowledgeSearchResult,
     system_prompt="""
-    Tu misión es analizar inteligentemente los resultados de una búsqueda y estructurarlos.
-    1.  **SIEMPRE** debes usar la herramienta `knowledge_search`.
-    2.  La herramienta te dará una lista de `results`. Analiza su contenido:
-        a. **Si todos los resultados pertenecen al MISMO servicio** (comparten el mismo `service_id`), consolida toda su información (`content`) en el campo `raw_information` y rellena `service_id` y `service_name`.
-        b. **Si los resultados pertenecen a VARIOS servicios DIFERENTES**, consolida la información de CADA UNO en `raw_information`, pero deja `service_id` y `service_name` en `null`.
-        c. **Si el resultado principal es un archivo de información** (ej. `source_type: 'file'`), pon su `content` en `raw_information` y asegúrate de que `service_id` y `service_name` queden en `null`.
-        d. **Si no hay resultados**, devuelve un `clarification_message`.
-    3.  Tu única salida debe ser el objeto `KnowledgeSearchResult` rellenado según estas reglas.
+    Tu misión es ser un experto en formular preguntas para buscar información.
+    1.  **Analiza la última pregunta del usuario** y el historial para entender su intención.
+    2.  **Formula la consulta de búsqueda más clara y concisa posible** para la herramienta `knowledge_search`. Por ejemplo, si el usuario pregunta "¿y cuánto cuesta?", tu consulta debe ser "precio". Si preguntan "¿qué contraindicaciones tiene?", tu consulta debe ser "contraindicaciones".
+    3.  La herramienta `knowledge_search` usará automáticamente el contexto del servicio actual si existe. No necesitas incluirlo en tu consulta.
+    4.  Una vez que recibas los resultados, **rellena el modelo `KnowledgeSearchResult`** de la forma más completa posible. Asegúrate de incluir `service_name` si lo encuentras en los resultados.
+    5.  **REGLA CRÍTICA:** Usa el campo `clarification_message` ÚNICAMENTE si la búsqueda NO arrojó resultados y necesitas pedirle al usuario que reformule su pregunta. Si encontraste información, este campo SIEMPRE debe quedar en `null`.
     """
 )
 
@@ -77,13 +77,22 @@ knowledge_agent = Agent[GlobalState, KnowledgeSearchResult](
 async def knowledge_search(ctx: RunContext[GlobalState], query: str) -> RawDataResult:
     """Busca en la base de datos y devuelve una lista de resultados crudos."""
     print(f"--- 🛠️ Herramienta: knowledge_search ---")
-    print(f"Query: '{query}'")
-    organization_id = ctx.deps.get("organization_id")
+    
+    state = ctx.deps
+    organization_id = state.get("organization_id")
+    service_id = state.get("service_id") # <-- OBTENER SERVICE_ID DEL ESTADO
+    
+    # Si estamos en un contexto de servicio, lo usamos para filtrar la búsqueda
+    if service_id:
+        print(f"✅ Búsqueda con contexto de servicio: service_id='{service_id}'")
+    
+    print(f"Query para el LLM: '{query}'")
+    
     if not organization_id:
         print("Resultado: No se encontró organization_id.")
         return RawDataResult(results=[])
     
-    matching_results = await search_knowledge_semantic(query, organization_id)
+    matching_results = await search_knowledge_semantic(query, organization_id, service_id=service_id)
     print(f"Resultado: Encontrados {len(matching_results)} resultados.")
     return RawDataResult(results=matching_results)
 

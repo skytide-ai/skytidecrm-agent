@@ -76,6 +76,8 @@ appointment_agent = Agent[GlobalState](
     'openai:gpt-4o',
     deps_type=GlobalState,
     system_prompt="""
+    **REGLA DE ORO - LÓGICA DE ESTADO:**
+    1.  **SI `available_slots` ya contiene horarios:** Tu ÚNICA prioridad es determinar si el usuario está seleccionando uno. Si su mensaje coincide con uno de los horarios mostrados (ej: "a las 10 am"), DEBES llamar INMEDIATAMENTE a `select_appointment_slot`. NO vuelvas a llamar a `check_availability`. Si el usuario pide otra fecha, el contexto se reseteará y el flujo comenzará de nuevo.
 
     **DETECCIÓN DE CAMBIOS DE CONTEXTO:**
     Antes de cualquier flujo, SIEMPRE verifica si el usuario está cambiando de contexto:
@@ -171,7 +173,10 @@ async def select_appointment_slot(
     seleccione un horario específico de los mostrados previamente.
     """
     state = ctx.deps
-    available_slots = state.get("available_slots", [])
+    available_slots_dicts = state.get("available_slots", [])
+    
+    # Deserializar los diccionarios de nuevo a objetos AvailabilitySlot
+    available_slots = [AvailabilitySlot(**slot_dict) for slot_dict in available_slots_dicts]
     
     if not available_slots:
         return SlotSelection(
@@ -185,7 +190,7 @@ async def select_appointment_slot(
     # Buscar el slot que coincida exactamente con la selección del usuario
     selected_slot = None
     for slot in available_slots:
-        if slot.get('start_time') == start_time:
+        if slot.start_time == start_time:
             selected_slot = slot
             break
     
@@ -629,6 +634,7 @@ async def run_appointment_agent(state: GlobalState) -> Command:
     print(f"🔍 contact_id: {state.get('contact_id')}")
     print(f"🔍 ready_to_book: {state.get('ready_to_book')}")
     print(f"🔍 organization_id: {state.get('organization_id')}")
+    print(f"🔍 available_slots: {state.get('available_slots')}")
     
     # 🚀 AUTO-AGENDAMIENTO: Si contact_id está listo, proceder directamente
     if (state.get('ready_to_book') and state.get('contact_id') and state.get('service_id') and 
@@ -661,18 +667,16 @@ async def run_appointment_agent(state: GlobalState) -> Command:
             goto="AppointmentAgent"  # Continuar en appointment_agent pero sin la bandera
         )
     
-    # VALIDACIÓN: Solo delegar al KnowledgeAgent si NO hay service_id
+    # VALIDACIÓN: Si NO hay service_id, no podemos agendar. Preguntar al usuario.
     if not state.get('service_id'):
-        print(f"🔍 No hay service_id en estado, delegando al KnowledgeAgent para resolver servicio")
-        # Crear un mensaje que indique al knowledge_agent que resuelva el servicio
-
-        current_messages = state.get("messages", [])
-        resolve_message = HumanMessage(content="Necesito encontrar el servicio específico que quiere agendar basándose en el contexto de la conversación.")
-        
-        # Actualizar estado con el mensaje de resolución y delegar
+        print("🔍 No hay service_id en estado. Preguntando al usuario por el servicio.")
+        ai_message = AIMessage(
+            content="¡Claro! Con gusto te ayudo a agendar. 😊 ¿Qué servicio te gustaría reservar?",
+            name="AppointmentAgent"
+        )
         return Command(
-            update={"messages": current_messages + [resolve_message]},
-            goto="KnowledgeAgent"
+            update={"messages": state.get("messages", []) + [ai_message]},
+            goto="__end__"  # Terminar el flujo actual, esperar respuesta del usuario
         )
 
     # Obtener contexto de memoria de Zep si hay chat_identity_id
@@ -681,7 +685,7 @@ async def run_appointment_agent(state: GlobalState) -> Command:
         thread_id = state['chat_identity_id']
         try:
             zep_context = await get_zep_memory_context(thread_id, min_rating=0.0)
-            print(f"🧠 DEBUG Contexto Zep: {zep_context[:200]}...")
+            print(f"🧠 DEBUG Contexto Zep: {zep_context}")
         except Exception as e:
             print(f"❌ Error obteniendo contexto de Zep thread {thread_id}: {e}")
             zep_context = ""
@@ -857,21 +861,26 @@ async def run_appointment_agent(state: GlobalState) -> Command:
             )
     
     if isinstance(tool_output, list) and all(isinstance(i, AvailabilitySlot) for i in tool_output):
-        slots = [s.dict() for s in tool_output]
-        if not slots:
+        slots_as_dicts = [s.dict() for s in tool_output]
+        # Convertir UUID a string para asegurar serialización JSON
+        for slot in slots_as_dicts:
+            slot['member_id'] = str(slot['member_id'])
+            
+        if not slots_as_dicts:
             ai_message = AIMessage(content="Lo siento, no encontré horarios disponibles. ¿Quieres intentar con otra fecha?", name="AppointmentAgent")
             return Command(
                 update={"messages": current_messages + [ai_message]},
                 goto="__end__"
             )
         
-        formatted_slots = ", ".join(sorted(list(set([s['start_time'] for s in slots]))))
+        # Formatear solo los start_time para el mensaje al usuario
+        formatted_slots = ", ".join(sorted(list(set([s['start_time'] for s in slots_as_dicts]))))
         date_used = "la fecha solicitada" # Simplificación, el agente debería extraer esto
         ai_message = AIMessage(content=f"Para {date_used} tengo estos horarios: {formatted_slots}. ¿Cuál prefieres?", name="AppointmentAgent")
         return Command(
             update={
                 "messages": current_messages + [ai_message],
-                "available_slots": slots
+                "available_slots": slots_as_dicts # Guardar la lista de diccionarios
             },
             goto="Supervisor"  # Regresar al supervisor para siguiente interacción
         )
