@@ -63,7 +63,7 @@ class SlotSelection(BaseModel):
     message: str = Field(min_length=1, description="Mensaje de confirmación")
     selected_date: str = Field(description="Fecha seleccionada en formato YYYY-MM-DD")
     selected_time: str = Field(description="Hora seleccionada en formato HH:MM")
-    member_id: str = Field(description="ID del miembro para el horario seleccionado")
+    member_id: str = Field(default="", description="ID del miembro para el horario seleccionado")
 
 class ContextReset(BaseModel):
     """Resultado del reseteo de contexto de agendamiento."""

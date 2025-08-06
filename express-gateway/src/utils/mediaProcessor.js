@@ -2,12 +2,23 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-);
+// Configuración de Supabase
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+const geminiApiKey = process.env.GEMINI_API_KEY;
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+if (!supabaseUrl || !supabaseAnonKey) {
+    console.error('❌ Error: SUPABASE_URL y SUPABASE_ANON_KEY deben estar configuradas en las variables de entorno');
+    process.exit(1);
+}
+
+if (!geminiApiKey) {
+    console.error('❌ Error: GEMINI_API_KEY debe estar configurada en las variables de entorno');
+    process.exit(1);
+}
+
+const supabase = createClient(supabaseUrl, supabaseAnonKey);
+const genAI = new GoogleGenerativeAI(geminiApiKey);
 
 /**
  * Descarga un archivo desde una URL y lo convierte a Buffer

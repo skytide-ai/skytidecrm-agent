@@ -124,7 +124,7 @@ router.post('/gupshup', async (req, res) => {
       });
 
       // 8. Enviar a Python Service
-      const pythonServiceUrl = `${process.env.PYTHON_API_URL}/invoke`;
+      const pythonServiceUrl = `${process.env.PYTHON_SERVICE_URL}/invoke`;
       const payload = {
         organizationId: organization_id,
         chatIdentityId,

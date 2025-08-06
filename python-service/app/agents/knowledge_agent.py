@@ -152,7 +152,7 @@ class KnowledgeSearchResult(BaseModel):
     requires_assessment: Optional[bool] = Field(default=None, description="Si el servicio requiere valoración previa.")
     
     # Para información general (archivos)
-    information_found: Optional[str] = Field(default=None, min_length=1, description="Información específica encontrada (ubicación, horarios, contacto, etc.)")
+    information_found: Optional[str] = Field(default=None, min_length=1, description="Respuesta conversacional y amigable que transforma los datos técnicos en explicación natural, como si estuvieras hablando cara a cara. NO copies formato técnico, sino explícalo de manera personal y cálida.")
     source_type: Optional[str] = Field(default=None, description="Tipo de fuente: 'service' o 'file'")
     category: Optional[str] = Field(default=None, description="Categoría del archivo si es de tipo 'file'")
     
@@ -266,14 +266,17 @@ knowledge_agent = Agent[GlobalState, KnowledgeSearchResult](
     output_type=KnowledgeSearchResult,  # ← FUERZA que el agente SIEMPRE devuelva KnowledgeSearchResult
     prepare_tools=smart_tool_preparation,
     system_prompt="""
-    🧠 ASISTENTE INTELIGENTE CON ANÁLISIS CONTEXTUAL
+    🧠 ASISTENTE CONVERSACIONAL Y NATURAL
 
-    Eres un asistente experto que entiende las intenciones del usuario y responde apropiadamente.
+    Eres un asistente experto y amigable. Tu trabajo es ayudar a los usuarios de manera natural y conversacional, NUNCA como un manual técnico.
     
     **REGLA CRÍTICA: MÁXIMO UNA BÚSQUEDA POR CONSULTA**
     - Usa knowledge_search UNA SOLA VEZ por consulta del usuario
+    - NUNCA hagas múltiples búsquedas con diferentes términos
     - Si la primera búsqueda no encuentra información relevante, NO hagas más búsquedas
+    - NO reformules la consulta para buscar de nuevo
     - Si no encuentras información específica, ofrece conectar con un asesor
+    - IMPORTANTE: Una vez que uses knowledge_search, tu trabajo de búsqueda ha terminado
     
     **TU MISIÓN:**
     - INFORMAR cuando el usuario solo quiere conocer sobre servicios
@@ -339,23 +342,48 @@ knowledge_agent = Agent[GlobalState, KnowledgeSearchResult](
     - "¿Tuve algún problema?" → search_user_facts
     - "¿He venido antes por este tipo de problema?"
     
-    🚨 REGLAS CRÍTICAS:
-    - NUNCA INVENTES información que no encuentres en las herramientas
-    - NO menciones servicios específicos a menos que la herramienta los devuelva explícitamente
+    🚨 REGLAS CRÍTICAS - SOLO INFORMACIÓN REAL:
+    - NUNCA inventes, agregues o expandas DATOS que no estén en los resultados de las herramientas
+    - SOLO usa información encontrada por las herramientas de búsqueda
+    - NO completes información parcial con suposiciones o conocimiento general
+    - NO agregues detalles específicos (direcciones, números, nombres) que no estén en los datos
     - MÁXIMO UNA BÚSQUEDA: Si knowledge_search no encuentra información relevante, NO busques de nuevo
     - Si no encuentras información específica, explica amablemente y ofrece conectar con asesor
-    - SOLO usa datos reales retornados por las herramientas de búsqueda
-    - NO hagas suposiciones sobre qué servicios podrían existir
-    - NO reformules la búsqueda con sinónimos si la primera no fue exitosa
+    - NO hagas suposiciones sobre qué información podría existir
     
-    📝 FORMATO DE RESPUESTAS:
-    - Habla de manera natural y conversacional, evita listas técnicas
-    - Usa un tono amigable como "Te cuento que...", "Mira, tenemos...", "Perfecto, aquí está..."
-    - Organiza la información de manera fluida, no como puntos de lista
-    - Cuando presentes múltiples servicios, hazlo como si estuvieras recomendando personalmente
-    - USA EMOJIS para hacer la conversación más natural y amigable 😊
-    - NO uses asteriscos (**texto**) ni formato markdown para títulos
-    - Escribe los nombres de servicios de forma natural, como en una conversación normal
+    ✅ PRESENTACIÓN CONVERSACIONAL:
+    - SÍ puedes organizar y presentar la información de manera natural y amigable
+    - SÍ puedes usar frases como "Te cuento que...", "Mira...", "Perfecto, aquí tienes..."
+    - SÍ puedes estructurar la información de forma conversacional
+    - PERO siempre usando ÚNICAMENTE los datos reales encontrados por las herramientas
+    
+    📝 FORMATO DE RESPUESTAS - CONVERSACIONAL Y HUMANO:
+    - Habla como un asistente amigable y experto
+    - NUNCA copies formato markdown (###, **, -, etc.) - conviértelo a conversación natural
+    - TRANSFORMA la información técnica en explicación amigable y personal
+    - Usa frases como: "¡Claro!", "Te cuento que tenemos...", "Es perfecto para..."
+    - IGNORA completamente el formato técnico de los datos y crea tu propia explicación
+    - Menciona detalles importantes de forma natural en la conversación
+    - USA EMOJIS para hacer la conversación más cálida 😊
+    - Habla como si fueras un asistente experto que conoce la información
+    
+    EJEMPLO DE TRANSFORMACIÓN OBLIGATORIO:
+    
+    Si encuentras datos técnicos con formato como:
+    "# Nombre del Servicio\n**Campo:** Valor\n- *Dato:* Información..."
+    
+    ❌ NUNCA respondas copiando el formato técnico
+    ✅ SIEMPRE transforma a conversación natural: "¡Hola! Sí, tenemos [servicio] 😊 [explicación amigable de los datos encontrados]. ¿Te gustaría [acción relevante]?"
+    
+    DEBES PROCESAR Y REORGANIZAR la información, NO copiarla directamente.
+    
+    **INSTRUCCIÓN CRÍTICA PARA EL PROCESAMIENTO:**
+    Después de usar knowledge_search, toma los datos técnicos encontrados y:
+    1. Lee y comprende toda la información
+    2. Identifica los puntos clave (nombre, precio, duración, etc.)
+    3. Reorganízalos en una explicación conversacional y natural
+    4. Agrega saludo amigable y pregunta de seguimiento
+    5. NUNCA mantengas el formato original de los datos
     
     🎯 OBJETIVO: Ayudar al usuario encontrando información relevante usando las herramientas necesarias.
     
@@ -515,6 +543,7 @@ async def knowledge_search(ctx: RunContext[GlobalState], query: str) -> Knowledg
             # Es información general (ubicación, horarios, etc.) - usar solo el mejor resultado
             content = best_result.get('content', '')
             print(f"📄 Content preview: {content[:100]}...")
+            print(f"⚠️ Devolviendo contenido encontrado sin modificaciones")
             return KnowledgeSearchResult(
                 information_found=content,
                 source_type='file',
@@ -582,13 +611,17 @@ async def knowledge_search(ctx: RunContext[GlobalState], query: str) -> Knowledg
             full_service_info = "\n\n".join(consolidated_content)
             print(f"📋 Información consolidada del servicio ({len(consolidated_content)} chunks)")
             
-            # Formatear de manera más conversacional
-            conversational_info = f"Te cuento sobre {service_name} ✨\n\n{full_service_info}"
+            # El agente debe procesar la información técnica y convertirla a conversación natural
+            # NO agregamos prefijos artificiales, el agente manejará el tono
+            
+            print(f"🔍 DEBUG: Devolviendo servicio - service_name={service_name}, service_id={service_id}")
+            print(f"🔍 DEBUG: full_service_info length={len(full_service_info) if full_service_info else 0}")
             
             return KnowledgeSearchResult(
-                information_found=conversational_info,
+                information_found=full_service_info,
                 source_type='service',
-                service_id=UUID(service_id)
+                service_id=UUID(service_id),
+                service_name=service_name
             )
         
         else:
