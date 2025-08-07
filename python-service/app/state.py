@@ -1,4 +1,4 @@
-from typing import TypedDict, Annotated, List, Optional, Any
+from typing import TypedDict, Annotated, List, Optional, Any, Dict
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
@@ -28,3 +28,6 @@ class GlobalState(TypedDict):
     
     # --- CAMPO AÑADIDO PARA EL RESULTADO DEL KNOWLEDGE AGENT ---
     knowledge_result: Optional[Any] = None
+    
+    # --- CAMPO PARA LA MÁQUINA DE ESTADOS DE AGENDAMIENTO ---
+    booking_status: Optional[str] = None

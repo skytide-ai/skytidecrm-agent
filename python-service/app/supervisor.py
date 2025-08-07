@@ -55,37 +55,61 @@ async def supervisor_node(state: GlobalState) -> Command:
     Agentes Disponibles: {', '.join(AGENT_NAMES)}.
     """
 
-    context_prompt = ""
-    if state.get("available_slots"):
-        print("-> CONTEXTO: Agendamiento (Slots Disponibles)")
-        context_prompt = """
-        **¡ATENCIÓN! CONTEXTO DE AGENDAMIENTO (FASE 1 - SELECCIÓN):**
-        - Acabas de presentar horarios. La prioridad es manejar la selección del usuario.
-        - **Prioridad 1 (Selección):** Si el usuario elige un horario (ej: "a las 10 am"), enruta a `AppointmentAgent`.
-        - **Prioridad 2 (Ajuste):** Si pide OTRA FECHA/HORA (ej: "¿y mañana?"), enruta a `AppointmentAgent`.
-        - **Prioridad 3 (Cambio de Tema):** Si pregunta por OTRO SERVICIO o tema, enruta a `KnowledgeAgent`.
-        """
-    elif state.get("service_id"):
-        print("-> CONTEXTO: Agendamiento (Servicio Seleccionado)")
-        context_prompt = f"""
-        **¡ATENCIÓN! CONTEXTO DE AGENDAMIENTO (FASE 0 - RECOLECCIÓN DE FECHA):**
-        - El usuario ya seleccionó o se le acaba de presentar el servicio '{state.get('service_name', 'desconocido')}' (ID: {state.get('service_id')}) y quiere agendar.
-        - **Prioridad 0 (Confirmación):** Si el usuario simplemente confirma que quiere ese servicio (ej: "sí", "ese está bien", "perfecto"), enruta a `AppointmentAgent` para que pida la fecha.
-        - **Prioridad 1 (Dar Fecha):** Si el usuario proporciona una fecha o referencia temporal (ej: "para mañana", "el lunes"), enruta a `AppointmentAgent` para que busque disponibilidad.
-        - **Prioridad 2 (Pregunta sobre Servicio Actual):** Si el usuario pregunta algo más sobre el servicio actual (ej: "¿cuánto dura?", "y el precio?"), enruta a `KnowledgeAgent`. La búsqueda se filtrará automáticamente.
-        - **Prioridad 3 (Cambio de Servicio):** Si pregunta por un servicio DIFERENTE, enruta a `KnowledgeAgent`.
-        """
-    else:
-        print("-> CONTEXTO: General (Sin Selección)")
-
-    routing_rules = """
-    **Reglas Generales de Enrutamiento (si no hay contexto específico):**
-    - **Consulta de Información:** Si el usuario pregunta por precios, horarios, servicios, etc., enruta a `KnowledgeAgent`.
-    - **Intención de Agendar:** Si el usuario quiere reservar o agendar (y no hay un contexto de agendamiento activo), enruta a `AppointmentAgent`.
-    - **Petición de Ayuda Humana:** Si el usuario está frustrado o pide hablar con una persona, enruta a `EscalationAgent`.
-    - **Conversación Casual:** Si es un saludo, despedida o agradecimiento, responde amablemente y pregunta cómo puedes ayudar, y enruta a `__end__`.
+    # 3. Lógica de Enrutamiento Basada en Estado Explícito (`booking_status`)
+    # Este es el núcleo de la nueva arquitectura de flujos.
     
-    Siempre debes devolver un objeto `Router` completo.
+    booking_status = state.get("booking_status")
+    print(f"🚥 SUPERVISOR: Estado de flujo actual -> {booking_status}")
+
+    context_prompt = ""
+    # --- FLUJO DE AGENDAMIENTO ---
+    if booking_status == 'NEEDS_DATE':
+        print("-> FLUJO: Necesita Fecha.")
+        context_prompt = """
+        **¡ATENCIÓN! ESTADO: `NEEDS_DATE`**
+        - El usuario ha seleccionado un servicio. Tu ÚNICA misión es pedirle la fecha.
+        - **Acción Obligatoria:** Enruta a `AppointmentAgent`.
+        """
+    elif booking_status == 'NEEDS_SLOT_SELECTION':
+        print("-> FLUJO: Necesita Selección de Horario.")
+        context_prompt = """
+        **¡ATENCIÓN! ESTADO: `NEEDS_SLOT_SELECTION`**
+        - Se le acaban de mostrar horarios al usuario.
+        - **Acción Obligatoria:** Enruta a `AppointmentAgent` para que procese la selección del usuario.
+        """
+    elif booking_status == 'NEEDS_CONTACT_INFO':
+        print("-> FLUJO: Necesita Información de Contacto.")
+        context_prompt = """
+        **¡ATENCIÓN! ESTADO: `NEEDS_CONTACT_INFO`**
+        - El usuario ha seleccionado un horario.
+        - **Acción Obligatoria:** Enruta a `AppointmentAgent` para que resuelva o pida los datos del contacto.
+        """
+    # --- FLUJO GENERAL (Cuando no hay un estado de agendamiento activo) ---
+    else:
+        print("-> FLUJO: General / Indeterminado.")
+        # Revisa si el último mensaje del asistente fue la pregunta inicial
+        latest_ai_message = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
+        if latest_ai_message and "¿Qué servicio te gustaría reservar?" in latest_ai_message.content:
+            print("-> CONTEXTO ADICIONAL: Respondiendo a pregunta inicial.")
+            context_prompt = """
+            **¡ATENCIÓN! CONTEXTO: SELECCIÓN INICIAL DE SERVICIO**
+            - Acabas de preguntar qué servicio desea el usuario. Su respuesta es el nombre del servicio.
+            - **Acción Obligatoria:** Enruta a `KnowledgeAgent` para buscar este servicio.
+            """
+        else:
+             context_prompt = """
+            **CONTEXTO: GENERAL**
+            - Analiza la intención del usuario.
+            - Si quiere información o agendar -> `KnowledgeAgent` para empezar.
+            - Si quiere hablar con un humano -> `EscalationAgent`.
+            - Si es una conversación casual -> Responde directamente y termina (`__end__`).
+            """
+            
+    routing_rules = """
+    **Reglas Generales de Enrutamiento:**
+    1.  Basa tu decisión PRIMERO en el estado de flujo (`booking_status`). Las instrucciones en el bloque `¡ATENCIÓN!` tienen prioridad absoluta.
+    2.  Si no hay un estado de flujo, usa el contexto general para decidir.
+    3.  Siempre devuelve un objeto `Router` completo.
     """
     
     system_prompt = f"{base_prompt}{context_prompt}{routing_rules}"
@@ -95,11 +119,30 @@ async def supervisor_node(state: GlobalState) -> Command:
     result = await supervisor_agent.run(latest_user_message.content, deps=state)
     router_output: Router = result.output
 
+    # --- Lógica de Actualización de Estado Post-Agentes ---
+    update_data = {}
+    
+    # Si venimos de KnowledgeAgent, transferimos la información al estado principal
+    knowledge_result = state.get("knowledge_result")
+    if knowledge_result:
+        if knowledge_result.service_id:
+            update_data["service_id"] = str(knowledge_result.service_id)
+        if knowledge_result.service_name:
+            update_data["service_name"] = knowledge_result.service_name
+        
+        # Actualizamos el booking_status si el KnowledgeAgent lo modificó
+        if state.get("booking_status"):
+            update_data["booking_status"] = state.get("booking_status")
+
+        update_data["knowledge_result"] = None
+        print(f"🧠 SUPERVISOR: Actualizando estado con datos de KnowledgeAgent y limpiando.")
+
     if router_output.next_agent == TERMINATE:
         ai_message = AIMessage(content=router_output.response or "¡Claro! ¿En qué más puedo ayudarte?", name="Supervisor")
-        return Command(update={"messages": state["messages"] + [ai_message]}, goto=TERMINATE)
-    
-    return Command(goto=router_output.next_agent)
+        update_data["messages"] = state.get("messages", []) + [ai_message]
+        return Command(update=update_data, goto=TERMINATE)
+
+    return Command(update=update_data, goto=router_output.next_agent)
 
 async def response_formatter_node(state: GlobalState) -> Command:
     """Nodo que formatea la salida de datos crudos en una respuesta conversacional."""
@@ -145,29 +188,44 @@ async def response_formatter_node(state: GlobalState) -> Command:
     service_context = f"Estamos hablando del servicio: '{knowledge_result.service_name}'." if knowledge_result.service_name else "No hay un servicio específico en contexto."
 
     prompt = f"""
-    Eres un asistente de IA experto en crear respuestas naturales y contextualmente relevantes. Tu tarea es responder a la pregunta del usuario de forma precisa.
+    Eres un Asistente de IA excepcional. Tu trabajo es tomar datos técnicos y transformarlos en una respuesta humana, cálida y útil. Tu objetivo principal es que el usuario sienta que está hablando con una persona amable, no con un robot.
 
-    **CONTEXTO DISPONIBLE:**
-    - **Pregunta del Usuario:** "{user_query}"
-    - **Contexto del Servicio:** {service_context}
-    - **Información Encontrada:**
+    **REGLA DE ORO: ¡LEE EL CONTEXTO!**
+    Antes de escribir una sola palabra, analiza TODO el contexto que se te proporciona:
+    - **Pregunta Original del Usuario:** "{user_query}"
+    - **Servicio en Foco:** {service_context}
+    - **Información Técnica Encontrada:**
       ---
       {knowledge_result.raw_information}
       ---
 
-    **TUS INSTRUCCIONES:**
-    1.  Usa la "Información Encontrada" para responder a la "Pregunta del Usuario".
-    2.  Si el "Contexto del Servicio" está disponible, ÚSALO para que tu respuesta suene más natural. Por ejemplo, en lugar de decir "Las contraindicaciones son...", di "Las contraindicaciones para el servicio de {knowledge_result.service_name} son...".
-    3.  Sé directo, amigable y usa emojis 😊. No resumas toda la información, solo responde la pregunta.
+    **TU MISIÓN - CÓMO CONSTRUIR LA RESPUESTA PERFECTA:**
+    1.  **NO SEAS UN LORO:** Nunca, bajo ninguna circunstancia, te limites a copiar y pegar la "Información Técnica Encontrada". Tu trabajo es **interpretarla** y usarla para **responder directamente** a la "Pregunta Original del Usuario".
+    2.  **SÉ CONVERSACIONAL:** Usa un tono amigable y natural. Utiliza emojis para darle calidez a la conversación 😊. Evita el formato markdown (como **negritas** o listas con guiones).
+    3.  **SÉ CONCISO Y DIRECTO:** Responde solo lo que el usuario preguntó. No le des un resumen de toda la información si solo preguntó por el precio.
+    4.  **UTILIZA EL NOMBRE DEL SERVICIO:** Si el "Servicio en Foco" está disponible, incorpóralo en tu respuesta para demostrar que tienes contexto.
 
-    **Ejemplo de respuesta ideal:**
-    "¡Claro! Las contraindicaciones para el servicio de Limpieza Facial Profunda son acné activo o tener la piel quemada por el sol ☀️."
+    **EJEMPLOS DE LO QUE DEBES HACER (Y NO HACER):**
+
+    - **CASO 1: El usuario pregunta por el precio de un servicio.**
+      - **MALO (robótico):** "La información encontrada es: Precio: $90.000 COP."
+      - **BUENO (humano):** "¡Claro! El precio de la Limpieza Facial Profunda es de $90.000 COP. ✨ ¿Te gustaría que busquemos una fecha para agendarla?"
+
+    - **CASO 2: El usuario pregunta por las contraindicaciones.**
+      - **MALO (demasiado técnico):** "Contraindicaciones: Acné activo severo, piel quemada por el sol."
+      - **BUENO (humano):** "Una cosa importante a tener en cuenta para la Limpieza Facial Profunda es que no se recomienda si tienes acné muy activo o la piel quemada por el sol. ☀️"
+
+    - **CASO 3: El usuario acaba de seleccionar un servicio y tú debes presentarlo.**
+      - **MALO (volcado de datos):** "Limpieza profesional del rostro que incluye exfoliación, extracción de impurezas, mascarilla y masaje facial. Precio: $90.000 COP..."
+      - **BUENO (conversacional y proactivo):** "¡Perfecto! La Limpieza Facial Profunda es genial para renovar la piel. Incluye exfoliación, extracción y mascarilla. 😊 ¿Te gustaría que te cuente más o buscamos directamente una fecha para tu cita?"
+
+    Ahora, crea la respuesta ideal para la pregunta del usuario.
     """
 
     formatter_agent = Agent('openai:gpt-4o', system_prompt=prompt)
     result = await formatter_agent.run("") 
     
-    formatted_response = str(result.data)
+    formatted_response = str(result.output)
     ai_message = AIMessage(content=formatted_response, name="Formatter")
     
     update_data = {"messages": state["messages"] + [ai_message]}

@@ -76,6 +76,11 @@ appointment_agent = Agent[GlobalState](
     'openai:gpt-4o',
     deps_type=GlobalState,
     system_prompt="""
+    **REGLA DE MEMORIA Y CONTEXTO (¡MUY IMPORTANTE!):**
+    Antes de decidir tu siguiente acción o pregunta, SIEMPRE revisa el historial de la conversación que se te proporciona.
+    - **NO PREGUNTES OTRA VEZ:** Si el usuario ya te ha dado una fecha (ej: "para mañana"), un servicio (ej: "limpieza facial"), o ha seleccionado un horario (ej: "a las 9 am"), NO vuelvas a pedir esa información. Usa la herramienta correspondiente (`check_availability`, `select_appointment_slot`, etc.) con la información que ya tienes.
+    - **RECONOCE LA INFORMACIÓN:** Si el usuario dice "ya te dije la fecha", tu respuesta debe ser algo como "Discúlpame, tienes razón. Procedo a buscar la disponibilidad para [fecha]".
+
     **REGLA DE ORO - LÓGICA DE ESTADO:**
     1.  **SI `available_slots` ya contiene horarios:** Tu ÚNICA prioridad es determinar si el usuario está seleccionando uno. Si su mensaje coincide con uno de los horarios mostrados (ej: "a las 10 am"), DEBES llamar INMEDIATAMENTE a `select_appointment_slot`. NO vuelvas a llamar a `check_availability`. Si el usuario pide otra fecha, el contexto se reseteará y el flujo comenzará de nuevo.
 
@@ -175,15 +180,21 @@ async def select_appointment_slot(
     state = ctx.deps
     available_slots_dicts = state.get("available_slots", [])
     
-    # Deserializar los diccionarios de nuevo a objetos AvailabilitySlot
-    available_slots = [AvailabilitySlot(**slot_dict) for slot_dict in available_slots_dicts]
+    # Deserializar los diccionarios de nuevo a objetos AvailabilitySlot para validación y uso.
+    # Esta es la corrección clave para el problema de persistencia de estado.
+    try:
+        available_slots = [AvailabilitySlot(**slot_dict) for slot_dict in available_slots_dicts]
+    except Exception as e:
+        print(f"Error al deserializar available_slots: {e}")
+        # Si hay un error, por ejemplo, porque el formato es incorrecto, tratar como si no hubiera slots.
+        available_slots = []
     
     if not available_slots:
         return SlotSelection(
             success=False,
-            message="No hay horarios disponibles previamente consultados. Busca disponibilidad primero.",
-            selected_date="",
-            selected_time="",
+            message="No hay horarios disponibles previamente consultados. Por favor, busca disponibilidad primero.",
+            selected_date=appointment_date,
+            selected_time=start_time,
             member_id=""
         )
     
@@ -204,7 +215,7 @@ async def select_appointment_slot(
         )
     
     # Guardar la selección
-    member_id = str(selected_slot.get('member_id'))
+    member_id = str(selected_slot.member_id)
     print(f"📅 SLOT SELECCIONADO: fecha={appointment_date}, hora={start_time}, member_id={member_id}")
     
     return SlotSelection(
@@ -763,6 +774,12 @@ async def run_appointment_agent(state: GlobalState) -> Command:
     
     tool_output = result.output
 
+    # 🕵️‍♂️ LÍNEAS DE DEPURACIÓN PARA EXPONER LA RAÍZ DEL PROBLEMA
+    print(f"\\n🕵️‍♂️ DEBUG: TIPO DE TOOL_OUTPUT: {type(tool_output)}\\n")
+    print(f"🕵️‍♂️ DEBUG: CONTENIDO DE TOOL_OUTPUT: {tool_output}\\n")
+    # 🕵️‍♂️ FIN DE LÍNEAS DE DEPURACIÓN
+
+
     # Obtener mensajes actuales para conservar el historial
     current_messages = state.get("messages", [])
 
@@ -806,7 +823,8 @@ async def run_appointment_agent(state: GlobalState) -> Command:
                     "messages": current_messages + [ai_message],
                     "selected_date": tool_output.selected_date,
                     "selected_time": tool_output.selected_time,
-                    "selected_member_id": tool_output.member_id
+                    "selected_member_id": tool_output.member_id,
+                    "booking_status": "NEEDS_CONTACT_INFO" # <-- ACTUALIZAR ESTADO DE FLUJO
                 },
                 goto="AppointmentAgent"  # Continuar para resolución de contacto
             )
@@ -860,11 +878,14 @@ async def run_appointment_agent(state: GlobalState) -> Command:
                 goto="__end__"
             )
     
-    if isinstance(tool_output, list) and all(isinstance(i, AvailabilitySlot) for i in tool_output):
-        slots_as_dicts = [s.dict() for s in tool_output]
-        # Convertir UUID a string para asegurar serialización JSON
+    # La salida de la herramienta de Pydantic AI es una lista de dicts, no de objetos.
+    # Esta verificación es crucial para evitar el loop.
+    if isinstance(tool_output, list) and all(isinstance(i, dict) and 'start_time' in i for i in tool_output):
+        slots_as_dicts = tool_output  # Ya son diccionarios
+        # Asegurarse de que member_id es un string para la serialización
         for slot in slots_as_dicts:
-            slot['member_id'] = str(slot['member_id'])
+            if 'member_id' in slot and not isinstance(slot['member_id'], str):
+                slot['member_id'] = str(slot['member_id'])
             
         if not slots_as_dicts:
             ai_message = AIMessage(content="Lo siento, no encontré horarios disponibles. ¿Quieres intentar con otra fecha?", name="AppointmentAgent")
@@ -875,14 +896,31 @@ async def run_appointment_agent(state: GlobalState) -> Command:
         
         # Formatear solo los start_time para el mensaje al usuario
         formatted_slots = ", ".join(sorted(list(set([s['start_time'] for s in slots_as_dicts]))))
-        date_used = "la fecha solicitada" # Simplificación, el agente debería extraer esto
-        ai_message = AIMessage(content=f"Para {date_used} tengo estos horarios: {formatted_slots}. ¿Cuál prefieres?", name="AppointmentAgent")
+        
+        # Extraer la fecha de la consulta del usuario para un mensaje más natural
+        last_user_message = state['messages'][-1].content
+        # Esta es una simplificación, en un caso real usaríamos NLP para extraer la fecha.
+        # Por ahora, asumimos que la última pregunta contenía la fecha deseada.
+        date_query = state.get("appointment_date_query", "la fecha solicitada")
+
+        ai_message = AIMessage(
+            content=f"¡Claro! Para {date_query} tengo estos horarios disponibles para tu {state.get('service_name', 'servicio')}: {formatted_slots}. ¿Cuál de ellos prefieres? 😊",
+            name="AppointmentAgent"
+        )
+        
+        print(f"✅ APPOINTMENT_AGENT: Guardando {len(slots_as_dicts)} slots en el estado.")
+        
+        # El agente necesita pedir la fecha, actualizamos el estado del flujo
+        if not any(state.get(key) for key in ["appointment_date_query", "selected_date", "available_slots"]):
+             update_data["booking_status"] = "NEEDS_DATE"
+
         return Command(
             update={
                 "messages": current_messages + [ai_message],
-                "available_slots": slots_as_dicts # Guardar la lista de diccionarios
+                "available_slots": slots_as_dicts,
+                "booking_status": "NEEDS_SLOT_SELECTION" # <-- ACTUALIZAR ESTADO DE FLUJO
             },
-            goto="Supervisor"  # Regresar al supervisor para siguiente interacción
+            goto="__end__"
         )
 
     if isinstance(tool_output, AppointmentConfirmation):

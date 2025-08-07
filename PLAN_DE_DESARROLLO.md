@@ -396,6 +396,58 @@ Python(Supervisor → Agentes) → saveOutgoing → Response
 
 ---
 
+## 7. 🔄 FASE 7: REFACTORIZACIÓN A ARQUITECTURA DE AGENTE ÚNICO (EN PLANIFICACIÓN)
+
+### 7.1. Justificación del Cambio de Enfoque
+
+Tras múltiples iteraciones, se ha identificado que la causa raíz de la inestabilidad y los bucles de conversación no es la lógica de los agentes individuales, sino la complejidad y fragilidad de la comunicación **entre** agentes a través de un supervisor. El estado no se propaga correctamente, y la inferencia del siguiente paso es propensa a errores.
+
+La documentación de LangGraph y las mejores prácticas de la industria sugieren que para casos de uso como el nuestro (un flujo de negocio claro con múltiples herramientas), un **único agente stateful que tiene acceso a todas las herramientas** es una arquitectura más robusta, simple y mantenible.
+
+**Beneficios Esperados:**
+-   **Eliminación de Bucles:** Al no haber un "enrutador" que pueda equivocarse, se eliminan los bucles de conversación.
+-   **Estado Centralizado y Robusto:** El estado es gestionado por un único grafo, eliminando problemas de serialización y propagación.
+-   **Simplicidad y Mantenibilidad:** Se reduce drásticamente la cantidad de código "pegamento" y la lógica de enrutamiento, haciendo el sistema más fácil de entender y depurar.
+-   **Alineación con la Documentación Oficial:** Seguiremos los patrones recomendados por los creadores de las librerías.
+
+### 7.2. Plan de Migración por Fases
+
+Este refactor se ejecutará en pasos claros y medibles para asegurar una transición controlada.
+
+#### **FASE 7.2.1: Consolidación del Agente (Master Agent)**
+
+-   [ ] **Crear `master_agent.py`**: Crear un nuevo archivo que contendrá al agente principal.
+-   [ ] **Unificar Herramientas**: Mover todas las funciones de herramientas (`check_availability`, `knowledge_search`, `select_appointment_slot`, etc.) desde `appointment_agent.py` y `knowledge_agent.py` a este nuevo archivo.
+-   [ ] **Crear el "Súper Prompt"**: Diseñar un único y detallado `system_prompt` para el `MasterAgent`. Este prompt contendrá el "manual de operaciones" completo, describiendo todos los flujos (conocimiento, agendamiento, cancelación, etc.) y cuándo usar cada herramienta.
+-   [ ] **Instanciar el `MasterAgent`**: Crear una única instancia del agente de Pydantic AI con acceso a **todas** las herramientas consolidadas.
+
+#### **FASE 7.2.2: Simplificación del Grafo (main.py)**
+
+-   [ ] **Eliminar Nodos Antiguos**: En `main.py`, remover las referencias y la lógica de `KnowledgeAgent`, `AppointmentAgent`, y el `Supervisor`.
+-   [ ] **Crear Grafo de Agente Único**: Construir un nuevo `StateGraph` mucho más simple.
+    -   **Nodo 1: `agent`**: Llama al `MasterAgent`.
+    -   **Nodo 2: `tools`**: Un `ToolNode` que ejecuta la herramienta que el `MasterAgent` haya decidido usar.
+-   [ ] **Definir Flujo Simple**:
+    -   La conversación siempre empieza en el nodo `agent`.
+    -   Usar `tools_condition` para decidir: si el agente llamó a una herramienta, ir al nodo `tools`; si no, `END`.
+    -   Después del nodo `tools`, siempre se regresa al nodo `agent` para que pueda procesar el resultado de la herramienta y continuar la conversación.
+
+#### **FASE 7.2.3: Limpieza y Eliminación de Código Obsoleto**
+
+-   [ ] **Eliminar `supervisor.py`**: El archivo ya no será necesario.
+-   [ ] **Eliminar `knowledge_agent.py`**: Su lógica estará en `master_agent.py`.
+-   [ ] **Eliminar `appointment_agent.py`**: Su lógica estará en `master_agent.py`.
+-   [ ] **Revisar `state.py`**: Asegurar que el `GlobalState` contenga todos los campos necesarios para los flujos, eliminando los que eran solo para el supervisor (si los hubiera).
+
+#### **FASE 7.2.4: Testing End-to-End**
+
+-   [ ] **Prueba de Flujo de Conocimiento**: Validar que las preguntas generales son respondidas correctamente.
+-   [ ] **Prueba de Flujo de Agendamiento Completo**: Realizar una reserva de principio a fin, validando la selección de servicio, fecha, horario y confirmación.
+-   [ ] **Prueba de Cambio de Intención**: Iniciar un flujo de agendamiento y luego hacer una pregunta de conocimiento para verificar que el agente puede cambiar de contexto sin romperse.
+-   [ ] **Prueba de Robustez**: Intentar "confundir" al agente para asegurar que el "Súper Prompt" es lo suficientemente robusto.
+
+---
+
 ## 🎯 PRÓXIMOS PASOS INMEDIATOS
 
 1. ✅ **🔑 COMPLETADO - Configuración OpenAI directo** - Sin comisiones de terceros

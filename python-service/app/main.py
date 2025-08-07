@@ -34,9 +34,11 @@ workflow.set_entry_point("Supervisor")
 # Ya no se necesita `add_conditional_edges`.
 
 # Definimos las conexiones estáticas entre los agentes y los siguientes pasos.
-workflow.add_edge("KnowledgeAgent", "ResponseFormatter")
+workflow.add_edge("KnowledgeAgent", "Supervisor")
+workflow.add_edge("AppointmentAgent", END) # AppointmentAgent debe terminar el turno
+
+# Los agentes de formato y escalación son terminales, finalizan el flujo.
 workflow.add_edge("ResponseFormatter", END)
-workflow.add_edge("AppointmentAgent", END)
 workflow.add_edge("EscalationAgent", END)
 
 # --- 3. Compilación del Grafo ---

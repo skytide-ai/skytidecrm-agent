@@ -64,12 +64,24 @@ knowledge_agent = Agent[GlobalState, KnowledgeSearchResult](
     deps_type=GlobalState,
     output_type=KnowledgeSearchResult,
     system_prompt="""
-    Tu misión es ser un experto en formular preguntas para buscar información.
-    1.  **Analiza la última pregunta del usuario** y el historial para entender su intención.
-    2.  **Formula la consulta de búsqueda más clara y concisa posible** para la herramienta `knowledge_search`. Por ejemplo, si el usuario pregunta "¿y cuánto cuesta?", tu consulta debe ser "precio". Si preguntan "¿qué contraindicaciones tiene?", tu consulta debe ser "contraindicaciones".
-    3.  La herramienta `knowledge_search` usará automáticamente el contexto del servicio actual si existe. No necesitas incluirlo en tu consulta.
-    4.  Una vez que recibas los resultados, **rellena el modelo `KnowledgeSearchResult`** de la forma más completa posible. Asegúrate de incluir `service_name` si lo encuentras en los resultados.
-    5.  **REGLA CRÍTICA:** Usa el campo `clarification_message` ÚNICAMENTE si la búsqueda NO arrojó resultados y necesitas pedirle al usuario que reformule su pregunta. Si encontraste información, este campo SIEMPRE debe quedar en `null`.
+    Tu misión es doble: actuar como un motor de búsqueda inteligente Y como un asistente conversacional que entiende la intención.
+
+    **FASE 1: ANÁLISIS DE INTENCIÓN Y BÚSQUEDA**
+    1.  **Analiza la pregunta del usuario:** ¿Está pidiendo información general ("qué servicios tienen"), información específica de un servicio ("cuánto cuesta la limpieza facial"), o confirmando su interés en un servicio para agendar?
+    2.  **Formula la consulta de búsqueda:** Crea la query más efectiva para la herramienta `knowledge_search`. Sé conciso.
+
+    **FASE 2: INTERPRETACIÓN DE RESULTADOS Y RESPUESTA**
+    1.  **Analiza los resultados de la búsqueda:**
+        - **Si NO hay resultados:** Usa `clarification_message` para pedir al usuario que reformule su pregunta.
+        - **Si hay resultados:** Procede a rellenar el `KnowledgeSearchResult`.
+    2.  **REGLA DE ORO - CONTEXTO DE AGENDAMIENTO:**
+        - Si el historial de conversación (que se te proporciona) indica que la intención principal es **AGENDAR**, tu objetivo NO es simplemente devolver la información.
+        - En este caso, debes:
+            a. Rellenar `service_id` y `service_name` con el servicio más relevante encontrado.
+            b. En `raw_information`, NO devuelvas toda la información. En su lugar, crea un mensaje de transición conversacional.
+            - **Ejemplo 1:** Si el usuario pregunta "¿tienen limpieza facial?", y la intención es agendar, tu `raw_information` debería ser algo como: "¡Sí, claro! Tenemos el servicio de Limpieza Facial Profunda. ¿Te gustaría que te dé más detalles o procedemos a buscar una fecha para agendar?"
+            - **Ejemplo 2:** Si el usuario pregunta "¿cuánto cuesta?", y la intención es agendar, tu `raw_information` debería ser: "El precio es de $90.000 COP. ¿Te gustaría buscar una fecha para este servicio?"
+    3.  **SI LA INTENCIÓN ES SOLO INFORMATIVA:** Si el usuario solo parece estar preguntando por curiosidad (ej: "¿qué contraindicaciones tiene?"), entonces sí puedes devolver la información específica que encontró la herramienta en `raw_information`.
     """
 )
 
@@ -102,7 +114,23 @@ async def run_knowledge_agent(state: GlobalState):
     print("--- Ejecutando Knowledge Agent (Con Logs) ---")
     user_query = state['messages'][-1].content
     
-    result = await knowledge_agent.run(user_query, deps=state)
+    # Construir un prompt enriquecido con el historial de la conversación
+    history = "\n".join([f"{msg.type}: {msg.content}" for msg in state.get("messages", [])])
+    
+    input_prompt = f"""
+    Historial de la Conversación:
+    ---
+    {history}
+    ---
+
+    Estado Actual (para tu contexto, no para el usuario):
+    - Servicio en foco (ID): {state.get('service_id')}
+    
+    Analiza el historial y el último mensaje del usuario para determinar la mejor acción.
+    Último mensaje del usuario: "{user_query}"
+    """
+    
+    result = await knowledge_agent.run(input_prompt, deps=state)
     
     tool_output = result.output
     
@@ -126,4 +154,11 @@ async def run_knowledge_agent(state: GlobalState):
         )
         print("⚠️ Salida del agente no fue `KnowledgeSearchResult`. Creando mensaje de error.")
 
-    return {"knowledge_result": tool_output}
+    update_data = {"knowledge_result": tool_output}
+
+    # Si encontramos un servicio, actualizamos el estado del flujo de agendamiento
+    if tool_output.service_id:
+        print(f"✅ Servicio encontrado. Actualizando booking_status a 'NEEDS_DATE'")
+        update_data["booking_status"] = "NEEDS_DATE"
+
+    return update_data
