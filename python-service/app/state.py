@@ -1,4 +1,5 @@
-from typing import TypedDict, Annotated, List, Optional, Any, Dict
+from typing_extensions import TypedDict
+from typing import Annotated, List, Optional, Any, Dict
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
@@ -31,3 +32,7 @@ class GlobalState(TypedDict):
     
     # --- CAMPO PARA LA MÁQUINA DE ESTADOS DE AGENDAMIENTO ---
     booking_status: Optional[str] = None
+    
+    # --- CAMPO PARA EL ENRUTADOR PRINCIPAL ---
+    current_flow: Optional[str] = None
+    zep_context: Optional[str] = None

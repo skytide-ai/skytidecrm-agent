@@ -112,6 +112,10 @@ router.post('/gupshup', async (req, res) => {
 
       // 6. Procesar Contenido del Mensaje
       let messageContent = req.body?.payload?.payload?.text || '[Mensaje multimedia]';
+      console.log(`🟢 [${processingId}] MENSAJE ENTRANTE`);
+      console.log(`   Org: ${organization_id}`);
+      console.log(`   From: ${phone}`);
+      console.log(`   Texto (${messageContent?.length || 0} chars): ${messageContent}`);
       // ... (lógica de processMedia iría aquí si se necesita)
 
       // 7. Guardar Mensaje Entrante
@@ -135,8 +139,9 @@ router.post('/gupshup', async (req, res) => {
         message: messageContent
       };
       
-      const responseFromPython = await axios.post(pythonServiceUrl, payload, { timeout: 30000 });
+      const responseFromPython = await axios.post(pythonServiceUrl, payload, { timeout: 60000 });
       const aiResponse = responseFromPython.data?.response || 'Sin respuesta';
+      console.log(`🔵 [${processingId}] RESPUESTA AGENTE (${aiResponse?.length || 0} chars): ${aiResponse}`);
 
       // 9. Enviar Respuesta a Gupshup
       const gupshupResult = await sendTextMessage(gupshup_api_key, whatsapp_business_number, phone, aiResponse);

@@ -16,8 +16,13 @@ def get_zep_client() -> AsyncZep:
     zep_api_key = os.environ.get("ZEP_API_KEY")
 
     if not zep_api_key:
-        print("Error: ZEP_API_KEY must be set for Zep Cloud.")
-        raise ValueError("Zep Cloud API Key is not configured.")
+        # No bloquear arranque si falta; usar mock ligero que cumple interfaz mínima
+        print("⚠️ ZEP_API_KEY no configurada. Ejecutando sin memoria de Zep.")
+        class _NoopZep:
+            async def thread(self, *args, **kwargs):
+                raise AttributeError
+        # Devolvemos un cliente AsyncZep con API key vacía no es válido; devolvemos un objeto mínimo
+        return None
     
     try:
         return AsyncZep(api_key=zep_api_key)
@@ -25,18 +30,67 @@ def get_zep_client() -> AsyncZep:
         print(f"Error creating Zep Cloud client: {e}")
         raise
 
-# Cliente global de Zep
+# Cliente global de Zep (puede ser None si no hay API key)
 zep_client = get_zep_client()
 
-# --- Funciones Auxiliares para Zep Cloud ---
+# --- Funciones de Memoria (NUEVA ESTRUCTURA) ---
+
+async def get_zep_context_block(thread_id: str, mode: str = "basic") -> Optional[str]:
+    """
+    Obtiene el 'Context Block' de Zep, que es un resumen optimizado para LLMs.
+    
+    Args:
+        thread_id: ID del thread.
+        mode: 'basic' (rápido, crudo) o 'summary' (lento, resumido).
+    """
+    try:
+        print(f"Buscando 'Context Block' de Zep para thread_id: {thread_id} (modo: {mode})")
+        if not zep_client:
+            return None
+        context_response = await zep_client.thread.get_user_context(thread_id=thread_id, mode=mode)
+        
+        if context_response and hasattr(context_response, 'context'):
+            print(f"✅ 'Context Block' de Zep encontrado.")
+            return context_response.context
+        else:
+            print("🤷 No se encontró 'Context Block' en Zep.")
+            return None
+    except Exception as e:
+        print(f"❌ Error obteniendo 'Context Block' de Zep thread {thread_id}: {e}")
+        return None
+
+async def get_zep_last_messages(thread_id: str, last_n: int = 6) -> List[Message]:
+    """
+    Obtiene los últimos N mensajes de un thread de Zep para memoria a corto plazo.
+    
+    Args:
+        thread_id: ID del thread.
+        last_n: Número de mensajes a obtener.
+    """
+    try:
+        print(f"Buscando los últimos {last_n} mensajes para thread_id: {thread_id}")
+        if not zep_client:
+            return []
+        thread_data = await zep_client.thread.get(thread_id)
+        
+        if thread_data and hasattr(thread_data, 'messages') and thread_data.messages:
+            last_messages = thread_data.messages[-last_n:]
+            print(f"✅ Memoria a corto plazo encontrada: {len(last_messages)} mensajes.")
+            return last_messages
+        else:
+            print("🤷 No se encontraron mensajes en la memoria de Zep.")
+            return []
+    except Exception as e:
+        print(f"❌ Error obteniendo últimos mensajes de Zep thread {thread_id}: {e}")
+        return []
+
+# --- Funciones Auxiliares (Existentes) ---
 
 async def ensure_user_exists(user_id: str, first_name: str = "", last_name: str = "", email: str = "") -> bool:
     """
-    Asegura que un usuario existe en Zep, usando la API oficial.
-    En Zep Cloud, si el usuario no existe, se crea automáticamente.
+    Asegura que un usuario existe en Zep.
     """
     try:
-        # Crear o actualizar usuario usando la API oficial de Zep Cloud
         await zep_client.user.add(
             user_id=user_id,
             first_name=first_name,
@@ -46,7 +100,6 @@ async def ensure_user_exists(user_id: str, first_name: str = "", last_name: str 
         print(f"✅ Usuario Zep creado: {user_id}")
         return True
     except Exception as e:
-        # Verificar si el error es porque el usuario ya existe (caso normal)
         error_str = str(e).lower()
         if "already exists" in error_str or "user already exists" in error_str:
             print(f"✅ Usuario Zep ya existe: {user_id}")
@@ -57,10 +110,9 @@ async def ensure_user_exists(user_id: str, first_name: str = "", last_name: str 
 
 async def ensure_thread_exists(thread_id: str, user_id: str) -> bool:
     """
-    Asegura que un thread existe en Zep, usando la API oficial.
+    Asegura que un thread existe en Zep.
     """
     try:
-        # Crear thread usando la API oficial de Zep Cloud
         await zep_client.thread.create(
             thread_id=thread_id,
             user_id=user_id
@@ -68,7 +120,6 @@ async def ensure_thread_exists(thread_id: str, user_id: str) -> bool:
         print(f"✅ Thread Zep creado: {thread_id} para usuario {user_id}")
         return True
     except Exception as e:
-        # Verificar si el error es porque el thread ya existe (caso normal)
         error_str = str(e).lower()
         if "already exists" in error_str or "session with id" in error_str:
             print(f"✅ Thread Zep ya existe: {thread_id}")
@@ -77,138 +128,31 @@ async def ensure_thread_exists(thread_id: str, user_id: str) -> bool:
             print(f"❌ Error creando thread Zep {thread_id}: {e}")
             return False
 
-async def add_messages_to_zep(thread_id: str, messages: List[Message], return_context: bool = False) -> Dict[str, Any]:
+async def add_messages_to_zep(thread_id: str, messages: List[Message]) -> Dict[str, Any]:
     """
-    Agrega mensajes a un thread de Zep usando la API oficial.
-    
-    Args:
-        thread_id: ID del thread
-        messages: Lista de mensajes a agregar
-        return_context: Si True, retorna el contexto inmediatamente sin llamada adicional
-    
-    Returns:
-        Dict con 'success' y opcionalmente 'context' si return_context=True
+    Agrega mensajes a un thread de Zep.
     """
     try:
-        # API oficial de Zep Cloud para agregar mensajes a un thread
+        if not zep_client:
+            return {"success": True}
         await zep_client.thread.add_messages(
             thread_id=thread_id, 
             messages=messages
         )
-        
-        result = {"success": True}
-        if return_context:
-            # Si se solicita contexto, usar la API oficial get_user_context
-            context_response = await zep_client.thread.get_user_context(thread_id=thread_id)
-            if context_response and hasattr(context_response, 'context'):
-                result["context"] = context_response.context
-            
-        return result
+        return {"success": True}
     except Exception as e:
         print(f"❌ Error agregando mensajes a Zep thread {thread_id}: {e}")
         return {"success": False, "error": str(e)}
 
-async def get_zep_memory_context(thread_id: str, min_rating: float = 0.0, mode: str = "basic") -> str:
-    """
-    Obtiene el contexto de memoria relevante desde Zep usando la API oficial.
-    
-    Args:
-        thread_id: ID del thread  
-        min_rating: Rating mínimo para filtrar contexto (no usado en API actual)
-        mode: "basic" para mejor performance (no usado en API actual)
-    """
-    try:
-        # Usar la API oficial de Zep Cloud para obtener contexto del thread
-        memory = await zep_client.thread.get_user_context(thread_id=thread_id)
-        return memory.context if memory and memory.context else ""
-    except Exception as e:
-        print(f"❌ Error obteniendo contexto de Zep thread {thread_id}: {e}")
-        return ""
-
-async def search_zep_facts(user_id: str, query: str, limit: int = 5) -> List[str]:
-    """
-    Busca hechos relevantes en las conversaciones de un usuario usando la API oficial.
-    """
-    try:
-        # Usar la API oficial de Zep Cloud para buscar edges/facts
-        result = await zep_client.graph.search(
-            user_id=user_id,
-            query=query,
-            limit=limit,
-            scope="edges"  # API oficial usa 'scope' en lugar de 'search_scope'
-        )
-        facts = []
-        if hasattr(result, 'edges') and result.edges:
-            for edge in result.edges:
-                if hasattr(edge, 'fact') and edge.fact:
-                    facts.append(edge.fact)
-        return facts
-    except Exception as e:
-        print(f"❌ Error buscando facts en Zep para {user_id}: {e}")
-        return []
-
-async def search_zep_nodes(user_id: str, query: str, limit: int = 5) -> List[str]:
-    """
-    Busca nodos/entidades relevantes en el grafo de conocimiento usando la API oficial.
-    """
-    try:
-        # Usar la API oficial de Zep Cloud para buscar nodes
-        result = await zep_client.graph.search(
-            user_id=user_id,
-            query=query,
-            limit=limit,
-            scope="nodes"  # API oficial usa 'scope' en lugar de 'search_scope'
-        )
-        nodes = []
-        if hasattr(result, 'nodes') and result.nodes:
-            for node in result.nodes:
-                if hasattr(node, 'summary') and node.summary:
-                    nodes.append(node.summary)
-        return nodes
-    except Exception as e:
-        print(f"❌ Error buscando nodes en Zep para {user_id}: {e}")
-        return []
-
-async def search_zep_sessions(user_id: str, query: str, limit: int = 5) -> List[str]:
-    """
-    Busca edges relacionados con sesiones/conversaciones usando graph.search.
-    """
-    try:
-        # Usar graph.search para buscar información de conversaciones
-        result = await zep_client.graph.search(
-            user_id=user_id,
-            query=query,
-            limit=limit,
-            scope="edges"  # Buscar en edges que contengan información de conversaciones
-        )
-        conversations = []
-        if hasattr(result, 'edges') and result.edges:
-            for edge in result.edges:
-                if hasattr(edge, 'fact') and edge.fact:
-                    conversations.append(edge.fact)
-        return conversations
-    except Exception as e:
-        print(f"❌ Error buscando conversaciones en Zep para {user_id}: {e}")
-        return []
-
 async def update_zep_user_with_real_data(user_id: str, first_name: str, last_name: str) -> bool:
     """
-    Actualiza un usuario de Zep con datos reales obtenidos durante el booking.
-    
-    Args:
-        user_id: ID del usuario en Zep (formato: chat_{chatIdentityId})
-        first_name: Nombre real del usuario
-        last_name: Apellido real del usuario
-    
-    Returns:
-        bool: True si la actualización fue exitosa
+    Actualiza un usuario de Zep con datos reales.
     """
     try:
         await zep_client.user.update(
             user_id=user_id,
             first_name=first_name,
             last_name=last_name
-            # Intencionalmente omitimos email según requerimiento
         )
         print(f"✅ Usuario Zep actualizado con datos reales: {user_id} -> {first_name} {last_name}")
         return True
@@ -216,7 +160,5 @@ async def update_zep_user_with_real_data(user_id: str, first_name: str, last_nam
         print(f"❌ Error actualizando usuario Zep {user_id}: {e}")
         return False
 
-
-
-# --- Configuración de Variables de Entorno ---
-# NOTA: Con Zep Cloud, ya no necesitamos ZEP_API_URL, solo ZEP_API_KEY 
+# NOTA: Se eliminaron las funciones de búsqueda de facts, nodes, etc. que no se estaban usando
+# para mantener el archivo limpio. Si se necesitan en el futuro, se pueden re-implementar.

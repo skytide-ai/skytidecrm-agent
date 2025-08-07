@@ -1,4 +1,5 @@
 import os
+import asyncio
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -27,3 +28,13 @@ def get_supabase_client() -> Client:
 # Crear una instancia global del cliente para ser usada en la aplicación.
 # Esto sigue el patrón de tener una única instancia a lo largo del ciclo de vida de la app.
 supabase_client = get_supabase_client() 
+
+
+async def run_db(operation):
+    """
+    Ejecuta una operación sincrónica del cliente de Supabase en un hilo para no bloquear el loop asíncrono.
+
+    Uso:
+        result = await run_db(lambda: supabase_client.table('contacts').select('*').execute())
+    """
+    return await asyncio.to_thread(operation)

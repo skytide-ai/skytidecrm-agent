@@ -1,10 +1,10 @@
 fastapi
 uvicorn
 langgraph
-zep-cloud
+zep-cloud>=3.0.0,<4
 python-dotenv
-pydantic-ai
 openai
+langchain-openai
 httpx
 supabase
-pytz 
+pytz

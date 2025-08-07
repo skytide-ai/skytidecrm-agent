@@ -1,3 +1,4 @@
+
 # PLAN DE DESARROLLO - AGENTE IA CONVERSACIONAL
 
 ## 1. Arquitectura del Sistema ✅ COMPLETADA
@@ -274,6 +275,13 @@ Supabase Storage → chat_messages → Python service (texto procesado)
 - **Escalabilidad**: 🔄 Consideraciones para múltiples instancias
 - **⭐ Media Caching**: 🔄 Optimización de acceso a archivos frecuentes
 
+### 6.5. Mejores Prácticas LangGraph/LangChain 🔧 NUEVO
+- **Checkpointer duradero (Redis)**: Migrar de `MemorySaver` a `langgraph-redis` para hilos concurrentes multi-tenant.
+- **Fallback del router**: Añadir reintentos guiados para `with_structured_output(Route)` en caso de error de parseo.
+- **Outputs homogéneos de tools**: Estandarizar respuestas que mutan estado con `{ action: string, ... }` (ej. `reset_appointment_context`, `select_appointment_slot`).
+- **Límite de recursión**: Establecer `recursion_limit` por defecto en 25 y elevar bajo diagnóstico.
+- **Observabilidad**: Integrar LangSmith o, mínimo, logs estructurados con `thread_id` y `tool_call_id` por paso.
+
 ---
 
 ## RESUMEN DE CAMBIOS ARQUITECTÓNICOS IMPORTANTES ✅
@@ -396,64 +404,126 @@ Python(Supervisor → Agentes) → saveOutgoing → Response
 
 ---
 
-## 7. 🔄 FASE 7: REFACTORIZACIÓN A ARQUITECTURA DE AGENTE ÚNICO (EN PLANIFICACIÓN)
+---
 
-### 7.1. Justificación del Cambio de Enfoque
+## 8. 🔄 FASE 8: REFACTORIZACIÓN A FLUJO DE CONVERSACIÓN CON NODOS (ARQUITECTURA RETELL)
 
-Tras múltiples iteraciones, se ha identificado que la causa raíz de la inestabilidad y los bucles de conversación no es la lógica de los agentes individuales, sino la complejidad y fragilidad de la comunicación **entre** agentes a través de un supervisor. El estado no se propaga correctamente, y la inferencia del siguiente paso es propensa a errores.
+### 8.1. Justificación del Cambio Arquitectónico
 
-La documentación de LangGraph y las mejores prácticas de la industria sugieren que para casos de uso como el nuestro (un flujo de negocio claro con múltiples herramientas), un **único agente stateful que tiene acceso a todas las herramientas** es una arquitectura más robusta, simple y mantenible.
+La arquitectura de "Agente Único" ha demostrado ser propensa a errores de lógica y bucles de conversación, ya que delega demasiado control de flujo a la interpretación de un único LLM con un prompt muy complejo.
+
+Inspirados en las mejores prácticas de frameworks como [Retell AI](https://docs.retellai.com/build/conversation-flow/overview), adoptaremos una arquitectura de **Grafo de Estados Explícito** utilizando `LangGraph`. Esto nos dará un control total y predecible sobre el flujo de la conversación, eliminando la ambigüedad y facilitando enormemente la depuración.
 
 **Beneficios Esperados:**
--   **Eliminación de Bucles:** Al no haber un "enrutador" que pueda equivocarse, se eliminan los bucles de conversación.
--   **Estado Centralizado y Robusto:** El estado es gestionado por un único grafo, eliminando problemas de serialización y propagación.
--   **Simplicidad y Mantenibilidad:** Se reduce drásticamente la cantidad de código "pegamento" y la lógica de enrutamiento, haciendo el sistema más fácil de entender y depurar.
--   **Alineación con la Documentación Oficial:** Seguiremos los patrones recomendados por los creadores de las librerías.
+-   **Robustez y Previsibilidad:** El flujo conversacional se define en el código a través de nodos y aristas, no en un prompt.
+-   **Depuración Sencilla:** Los logs mostrarán claramente el paso de un nodo a otro, permitiendo identificar fallos al instante.
+-   **Flexibilidad para Cambios de Intención:** Un nodo "Supervisor/Enrutador" central permitirá saltar entre diferentes flujos (agendamiento, conocimiento, etc.) de forma inteligente.
+-   **Mantenibilidad a Largo Plazo:** Añadir nuevos pasos o flujos será tan simple como añadir nuevos nodos y aristas al grafo.
 
-### 7.2. Plan de Migración por Fases
+### 8.2. Plan de Migración por Fases
 
-Este refactor se ejecutará en pasos claros y medibles para asegurar una transición controlada.
+#### **FASE 8.2.1: Creación del Grafo de Nodos Especializados**
 
-#### **FASE 7.2.1: Consolidación del Agente (Master Agent)**
+-   [ ] **Definir Nodos Principales en `main.py`**:
+    -   `supervisor_node`: Punto de entrada que analiza la intención del usuario y el estado actual para enrutar la conversación.
+    -   `knowledge_node`: Llama a la herramienta `knowledge_search` y formatea la respuesta.
+    -   `appointment_node`: Un sub-grafo que contendrá toda la lógica de agendamiento.
+    -   `cancellation_node`: Un sub-grafo para el flujo de cancelación de citas.
+    -   `confirmation_node`: Nodo final para resumir citas y gestionar opt-ins.
+    -   `escalation_node`: Nodo de seguridad para escalar a un humano.
 
--   [ ] **Crear `master_agent.py`**: Crear un nuevo archivo que contendrá al agente principal.
--   [ ] **Unificar Herramientas**: Mover todas las funciones de herramientas (`check_availability`, `knowledge_search`, `select_appointment_slot`, etc.) desde `appointment_agent.py` y `knowledge_agent.py` a este nuevo archivo.
--   [ ] **Crear el "Súper Prompt"**: Diseñar un único y detallado `system_prompt` para el `MasterAgent`. Este prompt contendrá el "manual de operaciones" completo, describiendo todos los flujos (conocimiento, agendamiento, cancelación, etc.) y cuándo usar cada herramienta.
--   [ ] **Instanciar el `MasterAgent`**: Crear una única instancia del agente de Pydantic AI con acceso a **todas** las herramientas consolidadas.
+-   [ ] **Implementar el `supervisor_node`**:
+    -   Crear un prompt específico para este nodo, cuyo único objetivo es decidir a qué otro nodo debe ir la conversación.
+    -   Debe devolver una decisión estructurada, por ejemplo: `{"next": "knowledge_node"}`.
 
-#### **FASE 7.2.2: Simplificación del Grafo (main.py)**
+-   [ ] **Configurar las Aristas Condicionales**:
+    -   En `main.py`, conectar el `supervisor_node` a los demás nodos principales usando `workflow.add_conditional_edges`.
 
--   [ ] **Eliminar Nodos Antiguos**: En `main.py`, remover las referencias y la lógica de `KnowledgeAgent`, `AppointmentAgent`, y el `Supervisor`.
--   [ ] **Crear Grafo de Agente Único**: Construir un nuevo `StateGraph` mucho más simple.
-    -   **Nodo 1: `agent`**: Llama al `MasterAgent`.
-    -   **Nodo 2: `tools`**: Un `ToolNode` que ejecuta la herramienta que el `MasterAgent` haya decidido usar.
--   [ ] **Definir Flujo Simple**:
-    -   La conversación siempre empieza en el nodo `agent`.
-    -   Usar `tools_condition` para decidir: si el agente llamó a una herramienta, ir al nodo `tools`; si no, `END`.
-    -   Después del nodo `tools`, siempre se regresa al nodo `agent` para que pueda procesar el resultado de la herramienta y continuar la conversación.
+#### **FASE 8.2.2: Construcción del Sub-Grafo de Agendamiento (`appointment_graph.py`)**
 
-#### **FASE 7.2.3: Limpieza y Eliminación de Código Obsoleto**
+-   [ ] **Crear `appointment_graph.py`**: Nuevo archivo para contener la lógica del flujo de agendamiento.
+-   [ ] **Definir Nodos del Sub-Grafo**:
+    -   `check_service_node`: Verifica si `service_id` existe.
+    -   `search_service_node`: Llama a la herramienta `knowledge_search`.
+    -   `confirm_service_node`: Pide al usuario que confirme el servicio encontrado.
+    -   `save_service_node`: Llama a la herramienta `update_service_in_state`.
+    -   `get_date_node`: Pregunta por la fecha.
+    -   `check_availability_node`: Llama a la herramienta `check_availability`.
+    -   `select_slot_node`: Llama a la herramienta `select_appointment_slot`.
+    -   `resolve_contact_node`: Llama a `resolve_contact_on_booking`.
+    -   `book_appointment_node`: Llama a la herramienta final `book_appointment`.
+-   [ ] **Conectar Nodos del Sub-Grafo**: Crear un `StateGraph` dentro de este archivo que defina el flujo lineal del agendamiento.
+-   [ ] **Integrar Sub-Grafo en `main.py`**: El `supervisor_node` enrutará al `appointment_graph` cuando la intención sea agendar.
 
--   [ ] **Eliminar `supervisor.py`**: El archivo ya no será necesario.
--   [ ] **Eliminar `knowledge_agent.py`**: Su lógica estará en `master_agent.py`.
--   [ ] **Eliminar `appointment_agent.py`**: Su lógica estará en `master_agent.py`.
--   [ ] **Revisar `state.py`**: Asegurar que el `GlobalState` contenga todos los campos necesarios para los flujos, eliminando los que eran solo para el supervisor (si los hubiera).
+#### **FASE 8.2.3: Refactorización de Herramientas y Estado**
 
-#### **FASE 7.2.4: Testing End-to-End**
+-   [ ] **Mover Herramientas a `tools.py`**: Crear un archivo `tools.py` para centralizar todas las funciones de herramientas (`knowledge_search`, `check_availability`, etc.), eliminándolas de `master_agent.py`.
+-   [ ] **Eliminar `master_agent.py`**: Este archivo ya no será necesario, ya que la lógica estará distribuida en los nodos.
+-   [ ] **Actualizar `state.py`**: Añadir un campo `current_flow: Optional[str]` al `GlobalState` para que el supervisor siempre sepa en qué flujo se encuentra el usuario (ej: "agendamiento", "conocimiento").
 
--   [ ] **Prueba de Flujo de Conocimiento**: Validar que las preguntas generales son respondidas correctamente.
--   [ ] **Prueba de Flujo de Agendamiento Completo**: Realizar una reserva de principio a fin, validando la selección de servicio, fecha, horario y confirmación.
--   [ ] **Prueba de Cambio de Intención**: Iniciar un flujo de agendamiento y luego hacer una pregunta de conocimiento para verificar que el agente puede cambiar de contexto sin romperse.
--   [ ] **Prueba de Robustez**: Intentar "confundir" al agente para asegurar que el "Súper Prompt" es lo suficientemente robusto.
+#### **FASE 8.2.4: Testing End-to-End**
+
+-   [ ] **Prueba de Flujo de Agendamiento Lineal**: Validar que el sub-grafo de agendamiento funciona de principio a fin sin interrupciones.
+-   [ ] **Prueba de Salto de Intención**:
+    -   Iniciar un flujo de agendamiento.
+    -   A mitad de camino, hacer una pregunta de conocimiento.
+    -   Verificar que el `supervisor_node` enruta correctamente al `knowledge_node` y luego puede regresar al flujo de agendamiento.
+-   [ ] **Prueba de Cambio de Contexto Completo**:
+    -   Iniciar un agendamiento para "masaje".
+    -   Decir "mejor quiero una limpieza facial".
+    -   Verificar que el supervisor reinicia el sub-grafo de agendamiento.
 
 ---
 
 ## 🎯 PRÓXIMOS PASOS INMEDIATOS
 
-1. ✅ **🔑 COMPLETADO - Configuración OpenAI directo** - Sin comisiones de terceros
-2. **🔑 Configurar `OPENAI_API_KEY`** - REQUERIDO para funcionalidad LLM
-3. **🔑 Configurar `GEMINI_API_KEY`** - CRÍTICO para funcionalidad de media
-4. **🧪 Testing con archivos reales** - Validar transcripción y descripción
-5. ✅ **📚 COMPLETADO - Documentar configuración** - Guía completa de variables de entorno
-6. **🔍 Implementar búsqueda semántica real** - KnowledgeAgent con datos de Supabase
-7. ✅ **🧪 COMPLETADO - Testing sistema completo** - Integración, errores, dependencias verificadas 
+1.  **Iniciar Fase 8.2.3**: Mover herramientas a `tools.py` y eliminar `master_agent.py`.
+2.  **Iniciar Fase 8.2.1**: Implementar `supervisor_node` y la estructura base del grafo en `main.py`.
+3.  **Iniciar Fase 8.2.2**: Construir el sub-grafo de agendamiento.
+4.  **Configurar Variables de Entorno**: `OPENAI_API_KEY` y `GEMINI_API_KEY` son críticas.
+5.  **Testing Progresivo**: Probar cada flujo a medida que se construye.
+
+## 9. 🔄 FASE 9: RECONSTRUCCIÓN TOTAL A ARQUITECTURA DE NODOS EXPERTOS (MODELO RETELL)
+
+### 9.1. Justificación y Análisis del Fallo
+
+Tras repetidos fracasos, se ha determinado que la arquitectura actual es fundamentalmente defectuosa. Aunque utiliza nodos, el control centralizado en un único `supervisor` que se re-ejecuta en cada turno crea bucles de conversación, ignora las entradas del usuario y provoca `timeouts`. El modelo de "supervisor" + "trabajadores tontos" ha fracasado.
+
+La solución es una reconstrucción completa para emular la arquitectura robusta de sistemas como Retell AI, basada en **Nodos Inteligentes (Agentes Expertos)** y un **control de flujo explícito a través de aristas condicionales**, donde la conversación permanece dentro de un nodo experto hasta que se resuelve su tarea o la intención del usuario cambia drásticamente.
+
+### 9.2. Plan de Reconstrucción
+
+#### **FASE 9.2.1: Transformar `knowledge_node` en el Primer Agente Experto (Prototipo)**
+
+-   [ ] **Crear `knowledge_agent_prompt.py`**:
+    -   Definir un prompt detallado que le dé al nodo la capacidad de razonar.
+    -   Instrucciones claras: si es un saludo, conversar; si es una pregunta, usar la herramienta `knowledge_search`.
+-   [ ] **Reescribir `knowledge_node` en `main.py`**:
+    -   Convertirlo en una cadena LangChain (Prompt + LLM + Herramientas).
+    -   El nodo ahora recibirá el estado y decidirá si llama a la herramienta o si genera una respuesta conversacional directamente.
+    -   La salida será siempre una `AIMessage`, que puede contener una llamada a herramienta o texto plano.
+
+#### **FASE 9.2.2: Transformar `appointment_node` en un Agente Experto Completo**
+
+-   [ ] **Eliminar el Sub-Grafo (`appointment_graph.py`)**: La lógica de agendamiento ya no estará en un grafo separado, sino dentro de la inteligencia del propio `appointment_node`.
+-   [ ] **Crear `appointment_agent_prompt.py`**:
+    -   Diseñar un prompt complejo que funcione como una máquina de estados conversacional.
+    -   Debe entender en qué paso del agendamiento se encuentra (ej: `buscando_servicio`, `pidiendo_fecha`, `seleccionando_hora`).
+    -   Debe saber qué herramienta llamar en cada paso (`knowledge_search`, `check_availability`, `book_appointment`).
+-   [ ] **Reescribir `appointment_node` en `main.py`**:
+    -   Implementarlo como una cadena LangChain (Prompt + LLM + Todas las herramientas de agendamiento).
+    -   La conversación **permanecerá dentro de este nodo** a través de múltiples turnos hasta que la cita se agende o el usuario cambie de intención.
+
+#### **FASE 9.2.3: Simplificar el Supervisor y las Conexiones del Grafo**
+
+-   [ ] **Redefinir el Rol del `supervisor`**:
+    -   Su único propósito será el enrutamiento inicial. No volverá a ejecutarse después de cada turno de un nodo experto.
+-   [ ] **Reestructurar las Aristas en `main.py`**:
+    -   Los nodos expertos (`knowledge_node`, `appointment_node`) ya no volverán al supervisor por defecto.
+    -   Se implementará una lógica de "auto-retorno" o un `edge` condicional que solo se active si la intención del usuario cambia drásticamente, forzando una re-evaluación del enrutamiento por parte del supervisor.
+
+#### **FASE 9.2.4: Testing del Nuevo Modelo**
+
+-   [ ] **Prueba de Conversación Casual**: Verificar que el `knowledge_node` responde a saludos sin buscar en la base de datos.
+-   [ ] **Prueba de Agendamiento Completo**: Realizar un agendamiento de principio a fin, verificando que la conversación se mantiene dentro del `appointment_node` y que este llama a las herramientas correctas en el orden correcto.
+-   [ ] **Prueba de Cambio de Intención**: Iniciar un agendamiento y luego hacer una pregunta. Verificar que el flujo puede salir del `appointment_node`, ser re-evaluado por el `supervisor` y entrar correctamente al `knowledge_node`.

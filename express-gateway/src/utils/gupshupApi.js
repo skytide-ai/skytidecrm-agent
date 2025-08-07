@@ -14,7 +14,7 @@ async function sendTextMessage(apiKey, sourceNumber, destinationNumber, message)
     console.log(`📤 Enviando mensaje via Gupshup:`);
     console.log(`   De: ${sourceNumber}`);
     console.log(`   Para: ${destinationNumber}`);
-    console.log(`   Mensaje: ${message.substring(0, 100)}${message.length > 100 ? '...' : ''}`);
+    console.log(`   Mensaje COMPLETO (${message.length} chars): ${message}`);
 
     // Crear payload en formato form-urlencoded según documentación de Gupshup
     const payload = new URLSearchParams({
