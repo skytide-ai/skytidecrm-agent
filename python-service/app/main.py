@@ -668,9 +668,9 @@ async def invoke(payload: InvokePayload, request: Request):
                 ai_response_content = extracted
             else:
                 # Fallback adicional
-                last_message = final_state_result["messages"][-1]
+            last_message = final_state_result["messages"][-1]
                 if isinstance(last_message, AIMessage):
-                    ai_response_content = last_message.content
+                ai_response_content = last_message.content
 
         # Log de salida del grafo
         try:

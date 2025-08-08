@@ -527,3 +527,91 @@ La solución es una reconstrucción completa para emular la arquitectura robusta
 -   [ ] **Prueba de Conversación Casual**: Verificar que el `knowledge_node` responde a saludos sin buscar en la base de datos.
 -   [ ] **Prueba de Agendamiento Completo**: Realizar un agendamiento de principio a fin, verificando que la conversación se mantiene dentro del `appointment_node` y que este llama a las herramientas correctas en el orden correcto.
 -   [ ] **Prueba de Cambio de Intención**: Iniciar un agendamiento y luego hacer una pregunta. Verificar que el flujo puede salir del `appointment_node`, ser re-evaluado por el `supervisor` y entrar correctamente al `knowledge_node`.
+
+---
+
+## 10. 🔐 FASE 10: MEMORIA CONVERSACIONAL EN SUPABASE + CHECKPOINTER REDIS (SUSTITUYE ZEP)
+
+### 10.1. Objetivo
+- Reemplazar Zep como capa de memoria para reducir costo/latencia y aumentar el control, manteniendo durabilidad del grafo con Redis.
+
+### 10.2. Alcance
+- Redis: checkpointer duradero para `LangGraph` y caché caliente de últimos N mensajes normalizados por hilo.
+- Supabase: memoria conversacional persistente (source of truth) con historial “normalizado” + resumen por hilo.
+- Sin nuevos vendors (no mem0 salvo que se solicite luego).
+
+### 10.3. Cambios en API Gateway (Express)
+- Guardado de mensajes entrantes con campos adicionales en `chat_messages`:
+  - `processed_text text` (transcripción/descripción enviada al LLM)
+  - `media_type text`, `media_url text`, `artifacts jsonb` (opcional)
+- Enviar al Python-service el `processedText` (si existe) como contenido del mensaje para contexto.
+- Mantener caché en memoria de `chat_identity` → `contact_id` y `first_name` (TTL 24h).
+- (Opcional) Push a Redis caché de conversación tras guardar en Supabase:
+  - Key: `chat:{organization_id}:{chat_identity_id}:messages`
+  - Operaciones sugeridas: `LPUSH` con mensaje normalizado y `LTRIM` para mantener N (p.ej., 25–50).
+
+### 10.4. Cambios en Python-service
+- Sustituir `MemorySaver` por `RedisSaver` de `langgraph-checkpoint-redis`:
+  - `pip install langgraph-checkpoint-redis redis`
+  - `REDIS_URL=redis://redis:6379` (o Upstash/ElastiCache)
+  - `with RedisSaver.from_conn_string(REDIS_URL) as cp: cp.setup(); app_graph = workflow.compile(checkpointer=cp)`
+- Nuevo módulo `app/memory.py`:
+  - `get_last_messages(chat_identity_id, n)`:
+    - Lectura preferente desde Redis caché (`chat:{org}:{chatId}:messages`).
+    - Fallback: leer de `chat_messages` en Supabase usando `processed_text || message`.
+  - `append_message_to_cache(chat_identity_id, role, content)` → agrega a Redis y recorta a N.
+  - `get_context_block(chat_identity_id)` → lee `thread_summaries.summary_text` (Supabase).
+  - `upsert_summary(chat_identity_id, summary_text)` → actualiza cada 8–12 turnos (Supabase).
+- Reemplazar `zep.py` y llamadas en `main.py` por utilidades anteriores.
+
+### 10.5. Esquema Supabase
+- Tabla `chat_messages` (ya existente): agregar columna `processed_text text` (y opcional `artifacts jsonb`).
+- Nueva tabla `thread_summaries`:
+  - `id uuid pk default gen_random_uuid()`
+  - `organization_id uuid not null` (FK)
+  - `chat_identity_id uuid not null` (FK)
+  - `summary_text text not null`
+  - `updated_at timestamptz not null default now()`
+  - Índices por `(organization_id, chat_identity_id)`
+
+### 10.6. Configuración y variables de entorno
+- `REDIS_URL` (obligatoria)
+- Eliminar `ZEP_*` del runtime (mantener solo si se necesita rollback).
+
+### 10.7. Plan de despliegue
+1) Migraciones Supabase: columnas nuevas + tabla `thread_summaries`.
+2) Actualizar gateway para persistir `processed_text` y (opcional) publicar a Redis caché de conversación.
+3) Añadir `langgraph-checkpoint-redis` y configurar `RedisSaver` en `main.py`.
+4) Implementar `memory.py` con lectura preferente desde Redis caché y fallback a Supabase; reemplazar referencias a Zep.
+5) Feature flag temporal: `USE_ZEP=false` → activar nueva memoria y checkpointer.
+6) Pruebas E2E: hilos con texto, audio e imagen; cancelación/confirmación/reagendamiento.
+
+### 10.8. Observabilidad
+- Logs con `thread_id` y tamaño de contexto (`last_messages_n`, tokens aprox. y si se usó `summary_text`).
+- Métricas: latencia promedio por turno, tasa de fallos, tamaño medio de `processed_text`, **cache hit-rate Redis** y latencia Redis.
+
+### 10.9. Riesgos y mitigación
+- Riesgo: pérdida de contexto al migrar. Mitigar haciendo doble escritura (Zep + Supabase) durante una ventana corta y validando equivalencias.
+- Riesgo: Redis no disponible. Mitigar con `ShallowRedisSaver` o fallback a in-memory en dev; alertas de salud.
+
+### 10.10. Criterios de aceptación
+- Checkpointer Redis activo y estable (reanudación correcta por `thread_id`).
+- Redis caché de últimos N operativo (hit-rate ≥ 80% en producción inicial) con fallback a Supabase.
+- `processed_text` persistido y usado para construir el historial.
+- Resumen por hilo actualizado y consultado en cada invocación.
+- Zep removido del camino crítico sin regresiones de UX.
+
+### 10.11. Buffer de mensajes (debounce 10s)
+- Objetivo: evitar múltiples invocaciones al servicio Python cuando el usuario envía varios mensajes cortos seguidos (ej.: "hola" → 3s → "cómo estás" → 5s → "qué limpiezas tienen?").
+- Diseño (Gateway):
+  - Mapa en memoria `pendingByChat` con clave `org:chatIdentityId` → { timer, items[] }.
+  - Al recibir un mensaje: guardar en Supabase (`chat_messages` con `processed_text`), agregar `processedText` normalizado a `items[]`, reiniciar timer a 10s.
+  - Al expirar el timer (10s sin nuevos mensajes): construir un único contenido combinando los `processedText` (p. ej., unidos por `\n`), enviar UNA sola solicitud a `/invoke` con ese contenido.
+  - Tamaño máximo configurable (p. ej. 3–5 mensajes por lote) para evitar prompts gigantes (si se excede, forzar flush anticipado).
+- Alternativa (si se prefiere más estructura):
+  - Enviar `batchedMessages: [{role: 'user', content: ...}, ...]` en el payload; el Python-service los insertará a su historial antes del turno actual. (Requiere pequeño cambio en `/invoke`).
+- Consideraciones:
+  - Los mensajes individuales igual quedan en `chat_messages` (SoR y CRM), por lo que no se pierde auditoría.
+  - El agente recibe el contexto concatenado en un solo turno, reduciendo latencia y evitando respuestas parciales.
+  - Mantener compatibilidad con media: siempre usar `processed_text` para agregar al buffer (no solo enlaces).
+
