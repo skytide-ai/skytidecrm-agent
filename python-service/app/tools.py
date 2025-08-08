@@ -239,27 +239,57 @@ def resolve_relative_date(date_text: str, timezone: str = "America/Bogota") -> D
         elif text in ("la otra semana", "la proxima semana", "la próxima semana", "proxima semana", "pr\u00f3xima semana"):
             resolved = today + timedelta(days=7)
         else:
-            # Formatos comunes: YYYY-MM-DD, DD/MM, DD-MM
-            import re
-            iso_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
-            if iso_match:
-                return {"success": True, "action": "set_selected_date", "selected_date": iso_match.group(1), "source_text": raw, "timezone": timezone}
-            dm_match = re.search(r"\b(\d{1,2})[/-](\d{1,2})\b", text)
-            if dm_match:
-                d = int(dm_match.group(1)); m = int(dm_match.group(2))
-                y = today.year
-                try:
-                    candidate = date(y, m, d)
-                except ValueError:
-                    return {"success": False, "message": "Fecha inválida."}
-                # Si ya pasó, asumir próximo año
-                if candidate < today:
+            # Días de la semana ("para el lunes", "este martes", "proximo viernes")
+            weekdays_map = {
+                "lunes": 0,
+                "martes": 1,
+                "miercoles": 2,
+                "jueves": 3,
+                "viernes": 4,
+                "sabado": 5,
+                "domingo": 6,
+            }
+            # patrón: opcional "para" y/o "el", modificador opcional, día obligatorio
+            dw_match = re.search(r"\b(?:para\s+)?(?:el\s+)?(?:(este|proximo|prox|siguiente)\s+)?(lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b", text)
+            if dw_match:
+                modifier = (dw_match.group(1) or "").strip()
+                day_str = dw_match.group(2)
+                target_wd = weekdays_map[day_str]
+                today_wd = today.weekday()
+                days_ahead = (target_wd - today_wd) % 7
+                # si dice "otra semana" o "la otra semana" en el texto, desplazamos +7
+                add_week = 7 if "otra semana" in text else 0
+                if modifier in ("proximo", "prox", "siguiente"):
+                    if days_ahead == 0:
+                        days_ahead = 7
+                elif modifier == "este":
+                    # mantener hoy si coincide; si no, usar dentro de esta semana
+                    pass
+                else:
+                    # sin modificador: si coincide hoy, tomar el siguiente
+                    if days_ahead == 0:
+                        days_ahead = 7
+                resolved = today + timedelta(days=days_ahead + add_week)
+            else:
+                # Formatos comunes: YYYY-MM-DD, DD/MM, DD-MM
+                iso_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+                if iso_match:
+                    return {"success": True, "action": "set_selected_date", "selected_date": iso_match.group(1), "source_text": raw, "timezone": timezone}
+                dm_match = re.search(r"\b(\d{1,2})[/-](\d{1,2})\b", text)
+                if dm_match:
+                    d = int(dm_match.group(1)); m = int(dm_match.group(2))
+                    y = today.year
                     try:
-                        candidate = date(y + 1, m, d)
+                        candidate = date(y, m, d)
                     except ValueError:
                         return {"success": False, "message": "Fecha inválida."}
-                return {"success": True, "action": "set_selected_date", "selected_date": candidate.isoformat(), "source_text": raw, "timezone": timezone}
-            return {"success": False, "message": "No pude interpretar la fecha."}
+                    if candidate < today:
+                        try:
+                            candidate = date(y + 1, m, d)
+                        except ValueError:
+                            return {"success": False, "message": "Fecha inválida."}
+                    return {"success": True, "action": "set_selected_date", "selected_date": candidate.isoformat(), "source_text": raw, "timezone": timezone}
+                return {"success": False, "message": "No pude interpretar la fecha."}
 
         return {"success": True, "action": "set_selected_date", "selected_date": resolved.isoformat(), "source_text": raw, "timezone": timezone}
     except Exception as e:

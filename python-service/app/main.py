@@ -4,15 +4,15 @@ from pydantic import BaseModel
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage
-from typing import Optional, Dict, Any, Literal
+from typing import Optional, Dict, Any, Literal, List
 import json
 
 # 1. Importaciones de la nueva arquitectura
 from .state import GlobalState
 from .tools import (
-    all_tools, knowledge_search, check_availability, 
+    all_tools, knowledge_search, check_availability,
     select_appointment_slot, book_appointment,
-    update_service_in_state, 
+    update_service_in_state,
     escalate_to_human, get_user_appointments, cancel_appointment
 )
 from langgraph.prebuilt import ToolNode
@@ -30,7 +30,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 class Route(PydanticBaseModel):
     """Decide a qué nodo dirigir la conversación a continuación."""
     next: Literal[
-        "knowledge", "appointment", "cancellation", "confirmation",
+        "knowledge", "appointment", "cancellation", "confirmation", "reschedule",
         "escalation", "__end__"
     ]
 
@@ -39,6 +39,20 @@ model_name = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
 llm = ChatOpenAI(model=model_name, temperature=0)
 print(f"⚙️ Modelo OpenAI activo: {model_name}")
 structured_llm_router = llm.with_structured_output(Route)
+
+# Utilidad para extraer un mensaje final útil del grafo
+def _extract_final_ai_content(messages: List[BaseMessage]) -> Optional[str]:
+    """Devuelve el contenido del AIMessage más reciente SIN tool_calls.
+    Si no hay, devuelve el contenido del AIMessage más reciente (aunque tenga tool_calls).
+    Si no hay AIMessage, None.
+    """
+    last_ai_with_tools: Optional[AIMessage] = None
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            if not getattr(msg, "tool_calls", None):
+                return msg.content
+            last_ai_with_tools = msg
+    return getattr(last_ai_with_tools, "content", None)
 
 supervisor_prompt = ChatPromptTemplate.from_messages(
     [
@@ -49,6 +63,8 @@ Eres el supervisor de un sistema de agentes de IA para un centro de estética. T
 - `knowledge`: Para saludos iniciales y preguntas generales sobre la empresa o servicios. Es puramente informativo.
 - `appointment`: Cuando el usuario expresa explícitamente el deseo de agendar, reservar o pedir una cita.
 - `cancellation`: Si el usuario quiere cancelar o reprogramar una cita existente.
+- `confirmation`: Si el usuario quiere confirmar una cita ya programada.
+- `reschedule`: Si el usuario quiere reagendar/reprogramar/cambiar fecha u hora de una cita ya creada.
 - `escalation`: Si el usuario está frustrado, pide hablar con un humano o el sistema falla repetidamente.
 - `__end__`: Únicamente para despedidas explícitas (ej. "adiós", "chao") o cuando la conversación ha concluido.
 
@@ -158,6 +174,9 @@ from .tools import (
     resolve_relative_date,
     find_appointment_for_cancellation,
     get_upcoming_user_appointments,
+    find_appointment_for_update,
+    confirm_appointment,
+    reschedule_appointment,
 )
 appointment_tools = [
     knowledge_search,
@@ -179,7 +198,7 @@ appointment_agent_prompt = ChatPromptTemplate.from_messages(
 
 **FASE ACTUAL (revisa `service_id` para saber en qué fase estás):**
 - **FASE 1: Identificación (si `service_id` es NULO)**
-  1. Si el último mensaje del usuario SOLO expresa intención genérica (p. ej., "quiero agendar"), primero PREGUNTA de forma clara: "¿Qué servicio te gustaría agendar?" y da 2-3 ejemplos. NO uses herramientas todavía.
+  1. Si el último mensaje del usuario SOLO expresa intención genérica (p. ej., "quiero agendar"), primero PREGUNTA de forma clara: "¿Qué servicio te gustaría agendar?". NO uses herramientas todavía.
   2. Solo si el ÚLTIMO mensaje contiene palabras clave de un servicio (p. ej., "masaje", "limpieza facial"), usa `knowledge_search` para identificarlo y luego PIDE confirmación.
   3. Tras confirmación explícita del usuario, usa `update_service_in_state` para guardar el servicio.
 
@@ -188,6 +207,7 @@ appointment_agent_prompt = ChatPromptTemplate.from_messages(
   2. Sigue estrictamente: Preguntar fecha -> `check_availability` (con `service_id`, `organization_id`, `check_date_str`) -> si hay slots, pedir hora y usar `select_appointment_slot` -> finalmente `book_appointment`.
   3. Nunca digas "no hay horarios" sin haber llamado antes a `check_availability` y sin haber verificado que la lista retornada esté vacía.
   4. Si el usuario expresa fechas relativas ("hoy", "mañana", "la otra semana", formatos DD/MM o DD-MM), primero usa `resolve_relative_date` con `timezone="America/Bogota"` para obtener `selected_date` en formato YYYY-MM-DD y luego llama a `check_availability`.
+  5. Al llamar `select_appointment_slot` DEBES pasar el parámetro `available_slots` exactamente como fue devuelto por `check_availability`. Si `available_slots` está vacío o no existe, primero vuelve a ejecutar `check_availability` y recién después llama a `select_appointment_slot`.
 
 **Cambio de servicio (cuando ya hay `service_id`):**
 - Si el usuario menciona explícitamente otro servicio distinto al actual (por nombre o sinónimos) o rechaza el actual, primero CONFIRMA: "¿Deseas cambiar al servicio ‘X’?".
@@ -198,6 +218,7 @@ appointment_agent_prompt = ChatPromptTemplate.from_messages(
 - Servicio: {service_name} (ID: {service_id})
 - Fecha: {selected_date}
 - Hora: {selected_time}
+ - Slots disponibles cargados: {available_slots}
 **Contexto Zep:** {zep_context}
 
 **Variables para herramientas (multitenancy):**
@@ -245,6 +266,7 @@ async def appointment_node(state: GlobalState) -> Dict[str, Any]:
             "service_name": state.get("service_name"),
             "selected_date": state.get("selected_date"),
             "selected_time": state.get("selected_time"),
+            "available_slots": state.get("available_slots"),
             "zep_context": state.get("zep_context", "No hay resumen."),
             "messages": state["messages"],
             "organization_id": state.get("organization_id"),
@@ -271,6 +293,7 @@ async def appointment_node(state: GlobalState) -> Dict[str, Any]:
 
 async def cancellation_node(state: GlobalState) -> Dict[str, Any]:
     print("--- ❌ NODO: Cancelación ---")
+    print(f"[cancel] contact_id actual: {state.get('contact_id')}")
     prompt = ChatPromptTemplate.from_messages([
         ("system", """
 Eres un asistente para cancelar citas. Flujo inteligente:
@@ -289,12 +312,128 @@ Responde breve y en segunda persona. No inventes datos. Usa herramientas cuando 
 **Estilo de comunicación:**
 - Empático y claro, con 1–2 emojis sutiles (p. ej., 🗓️, ⚠️, ✅). No abuses.
 - Propón opciones concretas para facilitar la elección.
+
+**Resolución de contacto (multitenancy):**
+- Si `contact_id` es nulo, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener/crear el contacto en CRM y usar su `contact_id` en las demás herramientas.
 """),
         MessagesPlaceholder("messages")
     ])
-    tools_for_cancel = [resolve_relative_date, find_appointment_for_cancellation, get_upcoming_user_appointments, cancel_appointment]
+    tools_for_cancel = [resolve_contact_on_booking, resolve_relative_date, find_appointment_for_cancellation, get_upcoming_user_appointments, cancel_appointment]
     runnable = prompt | llm.bind_tools(tools_for_cancel)
-    response = await runnable.ainvoke({"messages": state["messages"]})
+    print("[cancel] Últimos mensajes:")
+    try:
+        for m in state["messages"][-6:]:
+            role = type(m).__name__
+            print(f"  - {role}: {getattr(m, 'content', '')[:200]}")
+    except Exception:
+        pass
+    response = await runnable.ainvoke({
+        "messages": state["messages"],
+        "organization_id": state.get("organization_id"),
+        "contact_id": state.get("contact_id"),
+        "phone_number": state.get("phone_number"),
+        "country_code": state.get("country_code"),
+    })
+    try:
+        if isinstance(response, AIMessage) and getattr(response, "tool_calls", None):
+            calls_summary = [{"name": c.get("name"), "args": c.get("args")} for c in response.tool_calls]
+            print(f"🧰 (cancel) tool_calls: {json.dumps(calls_summary, ensure_ascii=False)}")
+        else:
+            print(f"🗣️ (cancel) respuesta directa: {getattr(response, 'content', '')[:300]}")
+    except Exception:
+        pass
+    return {"messages": [response]}
+
+async def confirmation_node(state: GlobalState) -> Dict[str, Any]:
+    print("--- ✅ NODO: Confirmación ---")
+    print(f"[confirm] contact_id actual: {state.get('contact_id')}")
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """
+Eres un asistente para confirmar citas. Flujo inteligente:
+
+1) Si el usuario no da fecha/hora, pide fecha. Si dice relativa, usa `resolve_relative_date` (America/Bogota) y guarda `selected_date`.
+2) Con `selected_date` (y hora si la da), usa `find_appointment_for_update(contact_id, date[, time])`.
+   - 0 resultados: informa que no encontraste citas para esa fecha y ofrece listar próximas con `get_upcoming_user_appointments(contact_id)`.
+   - 1 resultado: confirma explícitamente si desea confirmar esa cita y llama `confirm_appointment(appointment_id)`.
+   - >1 resultado: pide la hora exacta para desambiguar.
+3) Tras confirmar, responde con un mensaje de confirmación con fecha y hora.
+
+Responde breve, humano y con 1 emoji sutil.
+
+**Resolución de contacto (multitenancy):**
+- Si `contact_id` es nulo, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener/crear el contacto en CRM y usar su `contact_id` en las demás herramientas.
+"""),
+        MessagesPlaceholder("messages")
+    ])
+    tools_for_confirm = [resolve_contact_on_booking, resolve_relative_date, find_appointment_for_update, get_upcoming_user_appointments, confirm_appointment]
+    runnable = prompt | llm.bind_tools(tools_for_confirm)
+    print("[confirm] Últimos mensajes:")
+    try:
+        for m in state["messages"][-6:]:
+            role = type(m).__name__
+            print(f"  - {role}: {getattr(m, 'content', '')[:200]}")
+    except Exception:
+        pass
+    response = await runnable.ainvoke({
+        "messages": state["messages"],
+        "organization_id": state.get("organization_id"),
+        "contact_id": state.get("contact_id"),
+        "phone_number": state.get("phone_number"),
+        "country_code": state.get("country_code"),
+    })
+    try:
+        if isinstance(response, AIMessage) and getattr(response, "tool_calls", None):
+            calls_summary = [{"name": c.get("name"), "args": c.get("args")} for c in response.tool_calls]
+            print(f"🧰 (confirm) tool_calls: {json.dumps(calls_summary, ensure_ascii=False)}")
+        else:
+            print(f"🗣️ (confirm) respuesta directa: {getattr(response, 'content', '')[:300]}")
+    except Exception:
+        pass
+    return {"messages": [response]}
+
+async def reschedule_node(state: GlobalState) -> Dict[str, Any]:
+    print("--- 🔁 NODO: Reagendamiento ---")
+    print(f"[reschedule] contact_id actual: {state.get('contact_id')}")
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """
+Eres un asistente para reagendar citas. Flujo:
+
+1) Si el usuario no da fecha/hora nueva, pide la nueva fecha. Si es relativa, usa `resolve_relative_date` (America/Bogota) y guarda `selected_date`.
+2) Si el usuario conoce fecha/hora de la cita original: identifica la cita con `find_appointment_for_update(contact_id, old_date[, old_time])`. Si no la recuerda, ofrece listar con `get_upcoming_user_appointments(contact_id)`.
+3) Con la cita identificada, usa su `service_id` para calcular disponibilidad en la nueva fecha: `check_availability(service_id, organization_id, selected_date)` y muestra opciones. Tras elección, usa `select_appointment_slot`.
+4) Llama `reschedule_appointment(appointment_id, new_date, new_start_time, member_id, comment?)` y confirma el cambio.
+
+Sé claro y breve, con 1 emoji.
+
+**Resolución de contacto (multitenancy):**
+- Si `contact_id` es nulo, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener/crear el contacto en CRM y usar su `contact_id` en las demás herramientas.
+"""),
+        MessagesPlaceholder("messages")
+    ])
+    tools_for_res = [resolve_contact_on_booking, resolve_relative_date, find_appointment_for_update, get_upcoming_user_appointments, check_availability, select_appointment_slot, reschedule_appointment]
+    runnable = prompt | llm.bind_tools(tools_for_res)
+    print("[reschedule] Últimos mensajes:")
+    try:
+        for m in state["messages"][-6:]:
+            role = type(m).__name__
+            print(f"  - {role}: {getattr(m, 'content', '')[:200]}")
+    except Exception:
+        pass
+    response = await runnable.ainvoke({
+        "messages": state["messages"],
+        "organization_id": state.get("organization_id"),
+        "contact_id": state.get("contact_id"),
+        "phone_number": state.get("phone_number"),
+        "country_code": state.get("country_code"),
+    })
+    try:
+        if isinstance(response, AIMessage) and getattr(response, "tool_calls", None):
+            calls_summary = [{"name": c.get("name"), "args": c.get("args")} for c in response.tool_calls]
+            print(f"🧰 (reschedule) tool_calls: {json.dumps(calls_summary, ensure_ascii=False)}")
+        else:
+            print(f"🗣️ (reschedule) respuesta directa: {getattr(response, 'content', '')[:300]}")
+    except Exception:
+        pass
     return {"messages": [response]}
 
 async def escalation_node(state: GlobalState) -> Dict[str, Any]:
@@ -309,7 +448,8 @@ workflow.add_node("supervisor", supervisor_node)
 workflow.add_node("knowledge", knowledge_node)
 workflow.add_node("appointment", appointment_node)
 workflow.add_node("cancellation", cancellation_node)
-workflow.add_node("confirmation", confirmation_node := cancellation_node)
+workflow.add_node("confirmation", confirmation_node)
+workflow.add_node("reschedule", reschedule_node)
 workflow.add_node("escalation", escalation_node)
 tool_node = ToolNode(all_tools)
 workflow.add_node("tools", tool_node)
@@ -355,17 +495,25 @@ async def apply_tool_effects(state: GlobalState) -> Dict[str, Any]:
     elif tool_name == "resolve_relative_date" and isinstance(payload, dict):
         if payload.get("selected_date"):
             updates["selected_date"] = payload.get("selected_date")
+    elif tool_name == "resolve_contact_on_booking" and isinstance(payload, dict):
+        # Si resolvió/creó contacto, mantenerlo en estado para pasos siguientes
+        if payload.get("success") and payload.get("contact_id"):
+            updates["contact_id"] = payload.get("contact_id")
     elif tool_name == "check_availability" and isinstance(payload, list):
         # Guardar slots disponibles completos en estado
         updates["available_slots"] = payload
         print(f"📦 available_slots actualizados: {len(payload)}")
     elif tool_name == "select_appointment_slot" and isinstance(payload, dict):
-        if payload.get("selected_date"):
-            updates["selected_date"] = payload.get("selected_date")
-        if payload.get("selected_time"):
-            updates["selected_time"] = payload.get("selected_time")
-        if payload.get("member_id"):
-            updates["selected_member_id"] = payload.get("member_id")
+        if payload.get("success") is False:
+            # No se encontró el slot; forzar recálculo de disponibilidad en el siguiente turno
+            updates["available_slots"] = None
+        else:
+            if payload.get("selected_date"):
+                updates["selected_date"] = payload.get("selected_date")
+            if payload.get("selected_time"):
+                updates["selected_time"] = payload.get("selected_time")
+            if payload.get("member_id"):
+                updates["selected_member_id"] = payload.get("member_id")
 
     # Fallback genérico para cargas simples que traen selected_*
     if not updates and isinstance(payload, dict):
@@ -390,6 +538,7 @@ workflow.add_conditional_edges(
         "appointment": "appointment",
         "cancellation": "cancellation",
         "confirmation": "confirmation",
+        "reschedule": "reschedule",
         "escalation": "escalation",
         "__end__": END
     }
@@ -398,6 +547,8 @@ workflow.add_conditional_edges(
 workflow.add_conditional_edges("knowledge", decide_after_agent)
 workflow.add_conditional_edges("appointment", decide_after_agent)
 workflow.add_conditional_edges("cancellation", decide_after_agent)
+workflow.add_conditional_edges("confirmation", decide_after_agent)
+workflow.add_conditional_edges("reschedule", decide_after_agent)
 workflow.add_conditional_edges("escalation", decide_after_agent)
 
 workflow.add_edge("tools", "apply_tool_effects")
@@ -488,9 +639,28 @@ async def invoke(payload: InvokePayload, request: Request):
 
         ai_response_content = "No pude procesar tu solicitud."
         if final_state_result and final_state_result.get("messages"):
-            last_message = final_state_result["messages"][-1]
-            if isinstance(last_message, AIMessage) and not last_message.tool_calls:
-                ai_response_content = last_message.content
+            # Intentamos extraer la mejor respuesta posible del último tramo del grafo
+            extracted = _extract_final_ai_content(final_state_result["messages"]) or ""
+            if extracted.strip():
+                ai_response_content = extracted
+            else:
+                # Fallback adicional
+                last_message = final_state_result["messages"][-1]
+                if isinstance(last_message, AIMessage):
+                    ai_response_content = last_message.content
+
+        # Log de salida del grafo
+        try:
+            print("🧾 Estado final (resumen):")
+            print(json.dumps({
+                "messages_len": len(final_state_result.get("messages", [])),
+                "service_id": final_state_result.get("service_id"),
+                "selected_date": final_state_result.get("selected_date"),
+                "selected_time": final_state_result.get("selected_time"),
+                "available_slots_len": len(final_state_result.get("available_slots") or [])
+            }, ensure_ascii=False))
+        except Exception:
+            pass
 
         await add_messages_to_zep(session_id, [Message(role="assistant", content=ai_response_content)])
         return {"response": ai_response_content}
