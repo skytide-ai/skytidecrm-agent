@@ -10,16 +10,16 @@ import json
 # 1. Importaciones de la nueva arquitectura
 from .state import GlobalState
 from .tools import (
-    all_tools, knowledge_search, check_availability,
+    all_tools, knowledge_search, check_availability, 
     select_appointment_slot, book_appointment,
-    update_service_in_state,
+    update_service_in_state, 
     escalate_to_human, get_user_appointments, cancel_appointment
 )
 from langgraph.prebuilt import ToolNode
 
 # Zep Cloud Imports
 from .zep import add_messages_to_zep, ensure_user_exists, ensure_thread_exists, get_zep_context_block, get_zep_last_messages
-from .db import supabase_client
+from .db import supabase_client, run_db
 from langchain_openai import ChatOpenAI
 import os
 from pydantic import BaseModel as PydanticBaseModel
@@ -177,6 +177,7 @@ from .tools import (
     find_appointment_for_update,
     confirm_appointment,
     reschedule_appointment,
+    link_chat_identity_to_contact,
 )
 appointment_tools = [
     knowledge_search,
@@ -186,6 +187,7 @@ appointment_tools = [
     select_appointment_slot,
     book_appointment,
     resolve_contact_on_booking,
+    link_chat_identity_to_contact,
     escalate_to_human,
     get_user_appointments,
     cancel_appointment,
@@ -227,10 +229,14 @@ appointment_agent_prompt = ChatPromptTemplate.from_messages(
 - phone: {phone}
 - phone_number: {phone_number}
 - country_code: {country_code}
+- chat_identity_id: {chat_identity_id}
 
 Al invocar herramientas, usa estos valores exactamente para los parámetros correspondientes.
 
 Si `contact_id` es nulo y necesitas agendar, primero llama a `resolve_contact_on_booking` con `organization_id`, `phone_number` y `country_code` para obtener/crear el contacto.
+Si `contact_id` YA existe, NO llames `resolve_contact_on_booking` y NO digas que vas a verificar el contacto.
+
+Si `resolve_contact_on_booking` devuelve que faltan nombres, PIDE nombre y apellido al usuario y vuelve a llamar a `resolve_contact_on_booking` pasando `first_name` y `last_name`. Tras obtener `contact_id`, llama a `link_chat_identity_to_contact(chat_identity_id={chat_identity_id}, organization_id={organization_id}, contact_id=<id>)` para persistir el enlace.
 
 **Estilo de comunicación:**
 - Cercano, amable y proactivo. Mensajes cortos y claros.
@@ -274,6 +280,7 @@ async def appointment_node(state: GlobalState) -> Dict[str, Any]:
             "phone": state.get("phone"),
             "phone_number": state.get("phone_number"),
             "country_code": state.get("country_code"),
+            "chat_identity_id": state.get("chat_identity_id"),
             "last_user_message": last_user_message,
         }
     )
@@ -314,11 +321,13 @@ Responde breve y en segunda persona. No inventes datos. Usa herramientas cuando 
 - Propón opciones concretas para facilitar la elección.
 
 **Resolución de contacto (multitenancy):**
-- Si `contact_id` es nulo, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener/crear el contacto en CRM y usar su `contact_id` en las demás herramientas.
+- Si `contact_id` es NULO, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener/crear el contacto en CRM y usar su `contact_id` en las demás herramientas.
+- Si `contact_id` YA existe, NO llames `resolve_contact_on_booking` ni indiques que vas a verificar el contacto.
+- Si falta nombre/apellido, pídelos y vuelve a llamar pasando `first_name` y `last_name`. Luego, enlaza el contacto al hilo con `link_chat_identity_to_contact(chat_identity_id={chat_identity_id}, organization_id={organization_id}, contact_id=<id>)`.
 """),
         MessagesPlaceholder("messages")
     ])
-    tools_for_cancel = [resolve_contact_on_booking, resolve_relative_date, find_appointment_for_cancellation, get_upcoming_user_appointments, cancel_appointment]
+    tools_for_cancel = [resolve_contact_on_booking, link_chat_identity_to_contact, resolve_relative_date, find_appointment_for_cancellation, get_upcoming_user_appointments, cancel_appointment]
     runnable = prompt | llm.bind_tools(tools_for_cancel)
     print("[cancel] Últimos mensajes:")
     try:
@@ -333,6 +342,7 @@ Responde breve y en segunda persona. No inventes datos. Usa herramientas cuando 
         "contact_id": state.get("contact_id"),
         "phone_number": state.get("phone_number"),
         "country_code": state.get("country_code"),
+        "chat_identity_id": state.get("chat_identity_id"),
     })
     try:
         if isinstance(response, AIMessage) and getattr(response, "tool_calls", None):
@@ -361,11 +371,13 @@ Eres un asistente para confirmar citas. Flujo inteligente:
 Responde breve, humano y con 1 emoji sutil.
 
 **Resolución de contacto (multitenancy):**
-- Si `contact_id` es nulo, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener/crear el contacto en CRM y usar su `contact_id` en las demás herramientas.
+- Si `contact_id` es NULO, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener/crear el contacto en CRM y usar su `contact_id` en las demás herramientas.
+- Si `contact_id` YA existe, NO llames `resolve_contact_on_booking` ni indiques que vas a verificar el contacto.
+- Si la herramienta indica que faltan nombres, pide al usuario nombre y apellido, y vuelve a llamarla pasando `first_name` y `last_name`. Luego, enlaza el contacto al hilo con `link_chat_identity_to_contact(chat_identity_id={chat_identity_id}, organization_id={organization_id}, contact_id=<id>)`.
 """),
         MessagesPlaceholder("messages")
     ])
-    tools_for_confirm = [resolve_contact_on_booking, resolve_relative_date, find_appointment_for_update, get_upcoming_user_appointments, confirm_appointment]
+    tools_for_confirm = [resolve_contact_on_booking, link_chat_identity_to_contact, resolve_relative_date, find_appointment_for_update, get_upcoming_user_appointments, confirm_appointment]
     runnable = prompt | llm.bind_tools(tools_for_confirm)
     print("[confirm] Últimos mensajes:")
     try:
@@ -380,6 +392,7 @@ Responde breve, humano y con 1 emoji sutil.
         "contact_id": state.get("contact_id"),
         "phone_number": state.get("phone_number"),
         "country_code": state.get("country_code"),
+        "chat_identity_id": state.get("chat_identity_id"),
     })
     try:
         if isinstance(response, AIMessage) and getattr(response, "tool_calls", None):
@@ -406,11 +419,13 @@ Eres un asistente para reagendar citas. Flujo:
 Sé claro y breve, con 1 emoji.
 
 **Resolución de contacto (multitenancy):**
-- Si `contact_id` es nulo, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener/crear el contacto en CRM y usar su `contact_id` en las demás herramientas.
+- Si `contact_id` es NULO, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener/crear el contacto en CRM y usar su `contact_id` en las demás herramientas.
+- Si `contact_id` YA existe, NO llames `resolve_contact_on_booking` ni indiques que vas a verificar el contacto.
+- Si falta nombre/apellido, pídelos y vuelve a llamar pasando `first_name` y `last_name`. Luego, enlaza el contacto al hilo con `link_chat_identity_to_contact(chat_identity_id={chat_identity_id}, organization_id={organization_id}, contact_id=<id>)`.
 """),
         MessagesPlaceholder("messages")
     ])
-    tools_for_res = [resolve_contact_on_booking, resolve_relative_date, find_appointment_for_update, get_upcoming_user_appointments, check_availability, select_appointment_slot, reschedule_appointment]
+    tools_for_res = [resolve_contact_on_booking, link_chat_identity_to_contact, resolve_relative_date, find_appointment_for_update, get_upcoming_user_appointments, check_availability, select_appointment_slot, reschedule_appointment]
     runnable = prompt | llm.bind_tools(tools_for_res)
     print("[reschedule] Últimos mensajes:")
     try:
@@ -425,6 +440,7 @@ Sé claro y breve, con 1 emoji.
         "contact_id": state.get("contact_id"),
         "phone_number": state.get("phone_number"),
         "country_code": state.get("country_code"),
+        "chat_identity_id": state.get("chat_identity_id"),
     })
     try:
         if isinstance(response, AIMessage) and getattr(response, "tool_calls", None):
@@ -565,13 +581,20 @@ class InvokePayload(BaseModel):
     phone: str
     phoneNumber: str
     countryCode: str
+    firstName: Optional[str] = None
     message: str
 
 app = FastAPI()
 
 async def get_contact_data(contact_id: str, organization_id: str) -> Optional[Dict[str, Any]]:
     try:
-        response = await supabase_client.table('contacts').select('first_name, last_name').eq('id', contact_id).eq('organization_id', organization_id).maybe_single().execute()
+        response = await run_db(lambda: supabase_client
+                                .table('contacts')
+                                .select('first_name, last_name')
+                                .eq('id', contact_id)
+                                .eq('organization_id', organization_id)
+                                .maybe_single()
+                                .execute())
         return response.data if response.data else None
     except Exception as e:
         print(f"❌ Error obteniendo datos del contacto {contact_id}: {e}")
@@ -596,7 +619,7 @@ async def invoke(payload: InvokePayload, request: Request):
     user_id = f"contact_{payload.contactId}" if payload.contactId else f"chat_{session_id}"
     
     try:
-        first_name, last_name = "Usuario", ""
+        first_name, last_name = payload.firstName or "Usuario", ""
         if payload.contactId:
             contact_data = await get_contact_data(payload.contactId, payload.organizationId)
             if contact_data:

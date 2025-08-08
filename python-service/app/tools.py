@@ -304,9 +304,15 @@ async def resolve_contact_on_booking(organization_id: str, phone_number: str, co
             contact_id = response.data['id']
             return ContactResolution(success=True, contact_id=contact_id, message="Contacto reconocido.", is_existing_contact=True)
         else:
+            if not first_name or not last_name:
+                return ContactResolution(success=False, message="Faltan nombre y apellido para crear el contacto.")
+            # Crear contacto con nombres si fueron proporcionados, en caso contrario con valores por defecto
             insert_response = await run_db(lambda: supabase_client.table('contacts').insert({
-                'organization_id': organization_id, 'phone': phone_number, 'country_code': country_code,
-                'first_name': first_name or "Nuevo", 'last_name': last_name or "Contacto",
+                'organization_id': organization_id,
+                'phone': phone_number,
+                'country_code': country_code,
+                'first_name': first_name,
+                'last_name': last_name,
             }).execute())
             if not insert_response or not getattr(insert_response, 'data', None):
                 return ContactResolution(success=False, message="No fue posible crear el contacto")
@@ -513,7 +519,15 @@ async def get_user_appointments(contact_id: str) -> List[AppointmentInfo]:
     """Consulta y devuelve las citas futuras de un usuario."""
     try:
         today = date.today().isoformat()
-        response = await run_db(lambda: supabase_client.table('appointments').select('id, appointment_date, start_time, services(name), profiles(first_name, last_name)').eq('contact_id', contact_id).gte('appointment_date', today).in_('status', ['programada', 'confirmada']).order('appointment_date').order('start_time').execute())
+        response = await run_db(lambda: supabase_client
+                                .table('appointments')
+                                .select('id, appointment_date, start_time, services(name)')
+                                .eq('contact_id', contact_id)
+                                .gte('appointment_date', today)
+                                .in_('status', ['programada', 'confirmada'])
+                                .order('appointment_date')
+                                .order('start_time')
+                                .execute())
         if not response.data: return []
         return [AppointmentInfo(appointment_id=UUID(a['id']), summary=f"Cita para '{a.get('services', {}).get('name', '')}' con {a.get('profiles', {}).get('first_name', '')} el {a['appointment_date']} a las {a['start_time']}") for a in response.data]
     except Exception as e:
@@ -526,7 +540,7 @@ async def get_user_appointments_on_date(contact_id: str, date_str: str) -> List[
     try:
         response = await run_db(lambda: supabase_client
                                 .table('appointments')
-                                .select('id, appointment_date, start_time, services(name), profiles(first_name, last_name)')
+                                .select('id, appointment_date, start_time, services(name)')
                                 .eq('contact_id', contact_id)
                                 .eq('appointment_date', date_str)
                                 .in_('status', ['programada', 'confirmada'])
@@ -557,7 +571,7 @@ async def get_upcoming_user_appointments(contact_id: str, timezone: str = "Ameri
         # Citas futuras (fecha > hoy)
         fut_resp = await run_db(lambda: supabase_client
                                 .table('appointments')
-                                .select('id, appointment_date, start_time, services(name), profiles(first_name, last_name)')
+                                .select('id, appointment_date, start_time, services(name)')
                                 .eq('contact_id', contact_id)
                                 .gt('appointment_date', today)
                                 .in_('status', ['programada', 'confirmada'])
@@ -569,7 +583,7 @@ async def get_upcoming_user_appointments(contact_id: str, timezone: str = "Ameri
         # Citas de hoy con hora >= ahora
         today_resp = await run_db(lambda: supabase_client
                                   .table('appointments')
-                                  .select('id, appointment_date, start_time, services(name), profiles(first_name, last_name)')
+                                  .select('id, appointment_date, start_time, services(name)')
                                   .eq('contact_id', contact_id)
                                   .eq('appointment_date', today)
                                   .gte('start_time', now_time)
@@ -747,6 +761,20 @@ async def escalate_to_human(chat_identity_id: str, reason: str) -> Dict[str, Any
     print(f"--- 🚩 ESCALAMIENTO A HUMANO --- Razón: {reason}")
     return {"success": True, "message": "Un asesor humano será notificado."}
 
+@tool
+async def link_chat_identity_to_contact(chat_identity_id: str, organization_id: str, contact_id: str) -> Dict[str, Any]:
+    """Enlaza un chat_identity con un contact_id para persistir la resolución del contacto."""
+    try:
+        await run_db(lambda: supabase_client
+                     .table('chat_identities')
+                     .update({'contact_id': contact_id, 'last_seen': datetime.utcnow().isoformat()})
+                     .eq('id', chat_identity_id)
+                     .eq('organization_id', organization_id)
+                     .execute())
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "message": f"Error vinculando chat_identity: {e}"}
+
 all_tools = [
     knowledge_search,
     update_service_in_state,
@@ -765,4 +793,5 @@ all_tools = [
     get_user_appointments,
     cancel_appointment,
     escalate_to_human,
+    link_chat_identity_to_contact,
 ]

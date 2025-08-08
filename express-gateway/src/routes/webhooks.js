@@ -9,11 +9,20 @@ const { sendTextMessage } = require('../utils/gupshupApi');
 const processedMessages = new Map();
 const DEDUP_TTL = 5 * 60 * 1000; // 5 minutos
 
+// Cache de identidad/contacto por hilo (org+phone) para evitar consultas repetidas
+const identityCache = new Map(); // key: `${org}:${phone}` -> { chatIdentityId, contactId, firstName, ts }
+const IDENTITY_TTL = 24 * 60 * 60 * 1000; // 24 horas
+
 setInterval(() => {
   const now = Date.now();
   for (const [messageId, timestamp] of processedMessages.entries()) {
     if (now - timestamp > DEDUP_TTL) {
       processedMessages.delete(messageId);
+    }
+  }
+  for (const [key, entry] of identityCache.entries()) {
+    if (now - (entry?.ts || 0) > IDENTITY_TTL) {
+      identityCache.delete(key);
     }
   }
 }, 60000);
@@ -77,23 +86,62 @@ router.post('/gupshup', async (req, res) => {
         return;
       }
 
-      // 5. Resolver Chat Identity
+      // 5. Resolver Chat Identity (con caché)
       const sender = req.body?.payload?.sender;
       const phone = sender?.phone;
-      const { data: identity, error: identityError } = await supabase
-        .from('chat_identities')
-        .select('id, contact_id')
-        .eq('organization_id', organization_id)
-        .eq('platform_user_id', phone)
-        .single();
+      const cacheKey = `${organization_id}:${phone}`;
+      let cached = identityCache.get(cacheKey);
+      let chatIdentityId, contactId, firstName;
 
-      if (identityError && identityError.code !== 'PGRST116') { // Ignorar 'not found'
-        console.error(`❌ [${processingId}] Error buscando chat_identity:`, identityError);
-        return;
+      if (cached && (Date.now() - cached.ts) < IDENTITY_TTL) {
+        ({ chatIdentityId, contactId, firstName } = cached);
+      } else {
+        const { data: identity, error: identityError } = await supabase
+          .from('chat_identities')
+          .select('id, contact_id')
+          .eq('organization_id', organization_id)
+          .eq('platform_user_id', phone)
+          .single();
+
+        if (identityError && identityError.code !== 'PGRST116') { // Ignorar 'not found'
+          console.error(`❌ [${processingId}] Error buscando chat_identity:`, identityError);
+          return;
+        }
+        
+        chatIdentityId = identity?.id;
+        contactId = identity?.contact_id;
+
+        if (!chatIdentityId) {
+          const { data: newIdentity, error: createError } = await supabase
+            .from('chat_identities')
+            .insert({ organization_id, platform_user_id: phone, platform: 'whatsapp' })
+            .select('id')
+            .single();
+          if (createError) {
+            console.error(`❌ [${processingId}] Error creando chat_identity:`, createError);
+            return;
+          }
+          chatIdentityId = newIdentity.id;
+        } else {
+          await supabase.from('chat_identities').update({ last_seen: new Date().toISOString() }).eq('id', chatIdentityId);
+        }
+
+        // Si ya hay contactId, obtener first_name una sola vez
+        if (contactId) {
+          const { data: contact, error: contactErr } = await supabase
+            .from('contacts')
+            .select('first_name')
+            .eq('id', contactId)
+            .single();
+          if (contactErr && contactErr.code !== 'PGRST116') {
+            console.warn(`⚠️ [${processingId}] Error obteniendo first_name:`, contactErr?.message);
+          } else {
+            firstName = contact?.first_name || null;
+          }
+        }
+
+        identityCache.set(cacheKey, { chatIdentityId, contactId, firstName, ts: Date.now() });
       }
-      
-      let chatIdentityId = identity?.id;
-      let contactId = identity?.contact_id;
 
       if (!chatIdentityId) {
         const { data: newIdentity, error: createError } = await supabase
@@ -136,6 +184,7 @@ router.post('/gupshup', async (req, res) => {
         phone,
         countryCode: `+${sender.country_code}`,
         phoneNumber: sender.dial_code,
+        firstName,
         message: messageContent
       };
       
