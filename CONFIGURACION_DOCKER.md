@@ -10,11 +10,14 @@ SUPABASE_URL=https://tu-proyecto.supabase.co
 SUPABASE_ANON_KEY=tu-anon-key
 SUPABASE_SERVICE_ROLE_KEY=tu-service-role-key
 
-# Configuración de Zep Cloud
-ZEP_API_KEY=tu-zep-api-key
+# Configuración de Redis (opcional pero recomendado en prod)
+# Formato: redis://[:password]@host:port/0
+REDIS_URL=redis://localhost:6379/0
 
 # Configuración de OpenAI
 OPENAI_API_KEY=tu-openai-api-key
+# Modelo de chat (opcional). Por defecto: gpt-4o
+OPENAI_CHAT_MODEL=gpt-4o
 
 # Configuración de Gemini AI (para procesamiento de medios)
 GEMINI_API_KEY=tu-gemini-api-key
@@ -27,8 +30,8 @@ WEBHOOK_SECRET=tu-webhook-secret
 
 ### 1. **python-service** (Puerto 8000)
 - Agente principal con LangGraph
-- Maneja Knowledge, Appointment y Escalation agents
-- Integración con Supabase y Zep Cloud
+- Maneja Knowledge, Appointment, Confirmation, Cancellation, Reschedule y Escalation
+- Integración con Supabase (historial y resúmenes) y Redis como checkpointer (si `REDIS_URL` está definido)
 - Healthcheck en `http://localhost:8000/`
 
 ### 2. **express-gateway** (Puerto 8080)
@@ -139,7 +142,18 @@ Los servicios se comunican internamente a través de la red `skytidecrm-network`
 
 Este docker-compose está configurado específicamente para el **SkytideCRM Agent** con:
 - Integración completa con Supabase
-- Memoria persistente con Zep Cloud  
+- Memoria conversacional basada en Supabase (`chat_messages.processed_text` y `thread_summaries`)  
+- Durabilidad del grafo con Redis como checkpointer (si `REDIS_URL` está definido)
 - Arquitectura de agentes con LangGraph
 - Gateway para webhooks y API
 - Red interna optimizada para comunicación entre servicios
+
+### Detalles de Memoria (Supabase + Redis)
+- Historial corto: el servicio Python lee los últimos N mensajes desde `chat_messages` priorizando `processed_text`.
+- Contexto largo: el resumen del hilo se guarda/lee desde `thread_summaries`.
+- Estado del grafo: se persiste en Redis mediante el checkpointer de LangGraph (si `REDIS_URL` está presente). En ausencia de Redis, usa memoria en proceso.
+
+### Ejemplos de `REDIS_URL`
+- Local: `REDIS_URL=redis://localhost:6379/0`
+- Docker (servicio llamado `redis`): `REDIS_URL=redis://redis:6379/0`
+- Producción (Aiven/Upstash/ElastiCache): `REDIS_URL=redis://:PASSWORD@HOST:PORT/0`

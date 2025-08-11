@@ -4,7 +4,7 @@
 ## 1. Arquitectura del Sistema ✅ COMPLETADA
 
 ### 1.1. Stack Tecnológico Definido ✅
-- **Frontend**: Pydantic AI + LangGraph + Zep Cloud
+- **Frontend**: Pydantic AI + LangGraph
 - **Base de datos**: Supabase (PostgreSQL)
 - **API Gateway**: Express.js
 - **Servicio Python**: FastAPI
@@ -131,7 +131,7 @@ Pruebas → Express Gateway → Python Service
 - **Workflow**: ✅ Definido con nodos especializados y routing inteligente
 - **MemorySaver**: ✅ Configurado para persistencia de estado entre mensajes
 
-### 3.3. Integración con Zep Cloud ✅
+### 3.3. Integración con Zep Cloud ❌ Eliminada
 - **Cliente Zep**: ✅ Configurado y funcional
 - **Gestión de sesiones**: ✅ Historia de conversación persistente
 - **Optimización**: ✅ Simplificado gracias a MemorySaver de LangGraph
@@ -301,7 +301,7 @@ Supabase Storage → chat_messages → Python service (texto procesado)
   - ✅ Variables de entorno actualizadas (OPENAI_API_KEY)
   - ✅ Configuración simplificada sin headers adicionales
 
-### **⭐ MIGRACIÓN COMPLETA A ZEP CLOUD** ✅ COMPLETADO
+### **⭐ MIGRACIÓN COMPLETA A ZEP CLOUD** ❌ Eliminada
 - **Problema Inicial**: Implementación obsoleta con `zep-python` y APIs deprecated
 - **Solución**: Migración completa a `zep-cloud` con mejores prácticas
 - **Beneficios Implementados**:
@@ -530,7 +530,7 @@ La solución es una reconstrucción completa para emular la arquitectura robusta
 
 ---
 
-## 10. 🔐 FASE 10: MEMORIA CONVERSACIONAL EN SUPABASE + CHECKPOINTER REDIS (SUSTITUYE ZEP)
+## 10. 🔐 FASE 10: MEMORIA CONVERSACIONAL EN SUPABASE + CHECKPOINTER REDIS (SUSTITUYE ZEP) ✅ COMPLETADA
 
 ### 10.1. Objetivo
 - Reemplazar Zep como capa de memoria para reducir costo/latencia y aumentar el control, manteniendo durabilidad del grafo con Redis.
@@ -541,28 +541,25 @@ La solución es una reconstrucción completa para emular la arquitectura robusta
 - Sin nuevos vendors (no mem0 salvo que se solicite luego).
 
 ### 10.3. Cambios en API Gateway (Express)
-- Guardado de mensajes entrantes con campos adicionales en `chat_messages`:
+- [X] Guardado de mensajes entrantes con campos adicionales en `chat_messages`:
   - `processed_text text` (transcripción/descripción enviada al LLM)
   - `media_type text`, `media_url text`, `artifacts jsonb` (opcional)
-- Enviar al Python-service el `processedText` (si existe) como contenido del mensaje para contexto.
-- Mantener caché en memoria de `chat_identity` → `contact_id` y `first_name` (TTL 24h).
+- [X] Enviar al Python-service el `processedText` (si existe) como contenido del mensaje para contexto.
+- [X] Mantener caché en memoria de `chat_identity` → `contact_id` y `first_name` (TTL 24h).
+- [X] Buffer (debounce) 10s para consolidar mensajes en una sola invocación.
 - (Opcional) Push a Redis caché de conversación tras guardar en Supabase:
   - Key: `chat:{organization_id}:{chat_identity_id}:messages`
   - Operaciones sugeridas: `LPUSH` con mensaje normalizado y `LTRIM` para mantener N (p.ej., 25–50).
 
 ### 10.4. Cambios en Python-service
-- Sustituir `MemorySaver` por `RedisSaver` de `langgraph-checkpoint-redis`:
+- [X] Sustituir `MemorySaver` por `RedisSaver` de `langgraph-checkpoint-redis` si `REDIS_URL` definido; fallback a `MemorySaver`.
   - `pip install langgraph-checkpoint-redis redis`
   - `REDIS_URL=redis://redis:6379` (o Upstash/ElastiCache)
-  - `with RedisSaver.from_conn_string(REDIS_URL) as cp: cp.setup(); app_graph = workflow.compile(checkpointer=cp)`
-- Nuevo módulo `app/memory.py`:
-  - `get_last_messages(chat_identity_id, n)`:
-    - Lectura preferente desde Redis caché (`chat:{org}:{chatId}:messages`).
-    - Fallback: leer de `chat_messages` en Supabase usando `processed_text || message`.
-  - `append_message_to_cache(chat_identity_id, role, content)` → agrega a Redis y recorta a N.
-  - `get_context_block(chat_identity_id)` → lee `thread_summaries.summary_text` (Supabase).
-  - `upsert_summary(chat_identity_id, summary_text)` → actualiza cada 8–12 turnos (Supabase).
-- Reemplazar `zep.py` y llamadas en `main.py` por utilidades anteriores.
+- [X] Nuevo módulo `app/memory.py`:
+  - `get_last_messages(chat_identity_id, n)` → lee de `chat_messages` (usa `message`/`processed_text`).
+  - `get_context_block(chat_identity_id)` → lee `thread_summaries.summary_text`.
+  - `upsert_thread_summary(...)` disponible (pendiente autosummarize).
+- [X] `main.py` usa exclusivamente Supabase para memoria (Zep retirado).
 
 ### 10.5. Esquema Supabase
 - Tabla `chat_messages` (ya existente): agregar columna `processed_text text` (y opcional `artifacts jsonb`).
@@ -576,7 +573,7 @@ La solución es una reconstrucción completa para emular la arquitectura robusta
 
 ### 10.6. Configuración y variables de entorno
 - `REDIS_URL` (obligatoria)
-- Eliminar `ZEP_*` del runtime (mantener solo si se necesita rollback).
+- Eliminadas variables `ZEP_*` del runtime.
 
 ### 10.7. Plan de despliegue
 1) Migraciones Supabase: columnas nuevas + tabla `thread_summaries`.
@@ -614,4 +611,76 @@ La solución es una reconstrucción completa para emular la arquitectura robusta
   - Los mensajes individuales igual quedan en `chat_messages` (SoR y CRM), por lo que no se pierde auditoría.
   - El agente recibe el contexto concatenado en un solo turno, reduciendo latencia y evitando respuestas parciales.
   - Mantener compatibilidad con media: siempre usar `processed_text` para agregar al buffer (no solo enlaces).
+
+---
+
+## 11. 🚀 Guía de Implementación en Producción (cuando finalicen pruebas)
+
+### 11.1. Despliegue del API Gateway (Express)
+- Contenedor: `express-gateway`
+- Variables clave:
+  - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
+  - `PYTHON_SERVICE_URL` (ej.: `http://python-service:8000` o dominio público)
+  - `REDIS_URL` (para caché de últimos mensajes)
+  - `LOG_LEVEL` (info|debug)
+- Recomendaciones:
+  - Recursos mínimos: 0.5 vCPU / 256–512 MB RAM
+  - Habilitar healthcheck y restart `always`
+  - Exponer solo puerto público del gateway
+
+### 11.2. Despliegue del Servicio Python (FastAPI + LangGraph)
+- Contenedor: `python-service`
+- Variables clave:
+  - `OPENAI_API_KEY`, `OPENAI_CHAT_MODEL` (ej.: gpt-4o)
+  - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
+  - `REDIS_URL` (checkpointing de LangGraph)
+  - (Opcional observabilidad LLM) `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`
+- Recomendaciones:
+  - Recursos mínimos: 1 vCPU / 512–1024 MB RAM
+  - Restart `always`, healthcheck en `/`
+  - Limitar `recursion_limit` y saneo de entradas
+
+### 11.3. Observabilidad (stack separado)
+- Compose independiente: `infra/observabilidad/docker-compose.observability.yml`
+- Servicios incluidos:
+  - `langfuse` + `langfuse-db` (Postgres dedicado)
+  - `loki`, `promtail`, `grafana` para logs del gateway
+- Red compartida: `skytidecrm-network` (external)
+- Puertos sugeridos:
+  - Langfuse UI: 3001
+  - Grafana: 3000
+  - Loki: 3100 (interno)
+- Recomendaciones de recursos (idle aproximado):
+  - Langfuse: 200–350 MB (según uso)
+  - Postgres (Langfuse): 150–300 MB
+  - Loki+Promtail: 150–250 MB
+  - Grafana: 100–200 MB
+
+### 11.4. Red, dominios y seguridad
+- Crear red Docker: `docker network create skytidecrm-network`
+- Asignar dominios/subdominios:
+  - Gateway público (ej.: `gw.tu-dominio.com`)
+  - Python-service (interno o protegido)
+  - Langfuse (solo interno o protegido por auth)
+  - Grafana (protegido por credenciales fuertes)
+- TLS/HTTPS: mediante EasyPanel/Traefik/Caddy/Nginx (según tu setup)
+
+### 11.5. Checklist de pre-producción
+- [ ] Entorno `.env` completo en ambos servicios
+- [ ] `REDIS_URL` operativo
+- [ ] Migraciones Supabase aplicadas (`processed_text`, `thread_summaries`, `message_status pending`)
+- [ ] Pruebas E2E (texto/audio/imagen, agendar/confirmar/cancelar)
+- [ ] Logs verificados en Grafana (si usas Loki) o Dozzle
+- [ ] Langfuse recibiendo runs (si habilitado)
+
+### 11.6. Operación y soporte
+- Dashboards recomendados:
+  - Latencia p50/p95 del gateway y del `/invoke`
+  - Errores por organización
+  - Throughput por hora
+  - Estados de mensaje (`pending/sent/failed`)
+- Mantenimiento:
+  - Actualizaciones semanales de dependencias
+  - Backups del Postgres de Langfuse
+  - Rotación de logs en Loki (retención 7–14 días)
 

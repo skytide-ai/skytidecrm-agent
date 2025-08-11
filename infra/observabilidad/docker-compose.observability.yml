@@ -1,0 +1,90 @@
+version: "3.8"
+
+networks:
+  skytidecrm-network:
+    external: true
+
+volumes:
+  langfuse_db_data: {}
+  loki_data: {}
+  grafana_data: {}
+
+services:
+  # =====================
+  # Langfuse (para Python)
+  # =====================
+  langfuse-db:
+    image: postgres:15
+    container_name: langfuse-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${LANGFUSE_DB_NAME:-langfuse}
+      POSTGRES_USER: ${LANGFUSE_DB_USER:-langfuse}
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD:-langfuse_pass}
+    networks:
+      - skytidecrm-network
+    volumes:
+      - langfuse_db_data:/var/lib/postgresql/data
+
+  langfuse:
+    image: ghcr.io/langfuse/langfuse:latest
+    container_name: langfuse
+    restart: unless-stopped
+    depends_on:
+      - langfuse-db
+    environment:
+      DATABASE_URL: postgres://${LANGFUSE_DB_USER:-langfuse}:${LANGFUSE_DB_PASSWORD:-langfuse_pass}@langfuse-db:5432/${LANGFUSE_DB_NAME:-langfuse}
+      NEXTAUTH_URL: ${LANGFUSE_PUBLIC_URL:-http://localhost:3001}
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-change_me}
+      SALT: ${LANGFUSE_SALT:-change_me}
+      TELEMETRY_DISABLED: "true"
+    ports:
+      - "3001:3000" # UI Langfuse
+    networks:
+      - skytidecrm-network
+
+  # =====================
+  # Logs del Gateway
+  # =====================
+  loki:
+    image: grafana/loki:2.9.3
+    container_name: loki
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/loki
+      - ./loki-config.yml:/etc/loki/loki-config.yml:ro
+    networks:
+      - skytidecrm-network
+
+  promtail:
+    image: grafana/promtail:2.9.3
+    container_name: promtail
+    command: ["-config.file=/etc/promtail/config.yml"]
+    restart: unless-stopped
+    depends_on:
+      - loki
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./promtail-config.yml:/etc/promtail/config.yml:ro
+    networks:
+      - skytidecrm-network
+
+  grafana:
+    image: grafana/grafana:10.4.3
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - skytidecrm-network
+
+
+

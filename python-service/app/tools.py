@@ -334,10 +334,20 @@ async def check_availability(service_id: str, organization_id: str, check_date_s
     """Verifica la disponibilidad de horarios para un servicio en una fecha específica."""
     try:
         print(f"[check_availability] ▶️ Inicio | service_id={service_id}, organization_id={organization_id}, date={check_date_str}")
+        print(f"[check_availability] 🔍 UUID Debug - Longitud: {len(service_id)}, Caracteres: {repr(service_id)}")
+        
+        # Validar formato UUID
+        import uuid
+        try:
+            uuid.UUID(service_id)
+        except ValueError:
+            print(f"[check_availability] ❌ UUID inválido: {service_id}")
+            return []
+            
         check_date = datetime.strptime(check_date_str, "%Y-%m-%d").date()
         day_of_week = check_date.isoweekday()
-    except ValueError:
-        print(f"[check_availability] ⚠️ Fecha inválida: {check_date_str}")
+    except ValueError as e:
+        print(f"[check_availability] ⚠️ Error de validación: {e}")
         return []
 
     try:
@@ -492,7 +502,14 @@ async def book_appointment(organization_id: str, contact_id: str, service_id: st
         appointment_id = inserted_row['id']
         print(f"[book_appointment] ✅ Cita creada con id={appointment_id}")
         
-        auth_response = await run_db(lambda: supabase_client.table('contact_authorizations').select('authorization_type').eq('contact_id', contact_id).eq('channel', 'whatsapp').order('created_at', desc=True).limit(1).maybe_single().execute())
+        auth_response = await run_db(lambda: supabase_client
+                                     .table('contact_authorizations')
+                                     .select('authorization_type')
+                                     .eq('contact_id', contact_id)
+                                     .order('created_at', desc=True)
+                                     .limit(1)
+                                     .maybe_single()
+                                     .execute())
         opt_in_status = auth_response.data['authorization_type'] if auth_response.data else "not_set"
         print(f"[book_appointment] 🔐 WhatsApp opt-in status: {opt_in_status}")
         
@@ -504,12 +521,34 @@ async def book_appointment(organization_id: str, contact_id: str, service_id: st
         return AppointmentConfirmation(success=False, message=f"Error al agendar la cita: {e}")
 
 @tool
-async def create_whatsapp_opt_in(organization_id: str, contact_id: str) -> Dict[str, Any]:
-    """Crea un registro de autorización (opt-in) para WhatsApp."""
+async def create_whatsapp_opt_in(
+    organization_id: str,
+    contact_id: str,
+    user_agent: Optional[str] = None,
+    evidence: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Crea un registro de autorización (opt-in) para WhatsApp.
+
+    - Guarda channel='whatsapp'.
+    - Permite registrar `user_agent` y `evidence` (json) para auditoría.
+    """
     try:
-        await run_db(lambda: supabase_client.table('contact_authorizations').update({'is_active': False}).eq('contact_id', contact_id).eq('channel', 'whatsapp').execute())
-        opt_in_data = {'contact_id': contact_id, 'organization_id': organization_id, 'authorization_type': 'opt_in', 'channel': 'whatsapp', 'is_active': True, 'created_by': 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'}
-        await run_db(lambda: supabase_client.table('contact_authorizations').insert(opt_in_data).execute())
+        payload: Dict[str, Any] = {
+            'contact_id': contact_id,
+            'organization_id': organization_id,
+            'authorization_type': 'opt_in',
+            'channel': 'whatsapp',
+            'is_active': True,
+            'created_by': 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'
+        }
+        if user_agent:
+            payload['user_agent'] = user_agent
+        if evidence is not None:
+            payload['evidence'] = evidence
+        await run_db(lambda: supabase_client
+                     .table('contact_authorizations')
+                     .insert(payload)
+                     .execute())
         return {"success": True, "message": "Preferencia de notificaciones guardada."}
     except Exception as e:
         return {"success": False, "message": f"Error al guardar la preferencia: {e}"}
@@ -748,11 +787,20 @@ async def reschedule_appointment(appointment_id: str, new_date: str, new_start_t
 
 @tool
 async def cancel_appointment(appointment_id: str) -> AppointmentConfirmation:
-    """Cancela una cita actualizando su estado a 'cancelled'."""
+    """Cancela una cita actualizando su estado a 'cancelada'."""
     try:
-        await run_db(lambda: supabase_client.table('appointments').update({'status': 'cancelled'}).eq('id', appointment_id).execute())
-        return AppointmentConfirmation(success=True, message="Tu cita ha sido cancelada con éxito.")
-    except Exception:
+        print(f"[cancel_appointment] ▶️ Cancelando cita id={appointment_id}")
+        await run_db(lambda: supabase_client
+                     .table('appointments')
+                     .update({'status': 'cancelada'})
+                     .eq('id', appointment_id)
+                     .execute())
+        print(f"[cancel_appointment] ✅ Cancelada id={appointment_id}")
+        return AppointmentConfirmation(success=True, appointment_id=UUID(appointment_id), message="Tu cita ha sido cancelada con éxito.")
+    except Exception as e:
+        import traceback
+        print(f"[cancel_appointment] ❌ Error cancelando cita {appointment_id}: {e}")
+        traceback.print_exc()
         return AppointmentConfirmation(success=False, message="Lo siento, no pude cancelar tu cita.")
 
 @tool

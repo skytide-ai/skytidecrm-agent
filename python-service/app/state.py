@@ -35,4 +35,4 @@ class GlobalState(TypedDict):
     
     # --- CAMPO PARA EL ENRUTADOR PRINCIPAL ---
     current_flow: Optional[str] = None
-    zep_context: Optional[str] = None
+    context_block: Optional[str] = None

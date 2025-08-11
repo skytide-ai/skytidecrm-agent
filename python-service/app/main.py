@@ -3,9 +3,12 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import ToolNode
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from typing import Optional, Dict, Any, Literal, List
 import json
+import asyncio
 
 # 1. Importaciones de la nueva arquitectura
 from .state import GlobalState
@@ -15,17 +18,40 @@ from .tools import (
     update_service_in_state, 
     escalate_to_human, get_user_appointments, cancel_appointment
 )
-from langgraph.prebuilt import ToolNode
-
-# Zep Cloud Imports
-from .zep import add_messages_to_zep, ensure_user_exists, ensure_thread_exists, get_zep_context_block, get_zep_last_messages
-from .db import supabase_client, run_db
-from langchain_openai import ChatOpenAI
+from langchain_core.runnables import RunnableConfig
+from langchain_core.load import dumps, loads
 import os
 from pydantic import BaseModel as PydanticBaseModel
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from .db import supabase_client, run_db
+from .memory import (
+    get_last_messages as sb_get_last_messages,
+    get_context_block as sb_get_context_block,
+    upsert_thread_summary as sb_upsert_thread_summary,
+)
+from langchain_openai import ChatOpenAI
+ 
+# Integración opcional con Langfuse (observabilidad LLM)
+LANGFUSE_ENABLED = bool(os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY") and os.getenv("LANGFUSE_HOST"))
+lf_handler = None
+if LANGFUSE_ENABLED:
+    try:
+        # Preferido en versiones recientes
+        from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
+        lf_handler = LangfuseCallbackHandler()
+        print("🛰️ Langfuse habilitado para trazas LLM")
+    except Exception:
+        try:
+            # Compatibilidad con layout anterior
+            from langfuse.callback.langchain import CallbackHandler as LangfuseCallbackHandler
+            lf_handler = LangfuseCallbackHandler()
+            print("🛰️ Langfuse habilitado para trazas LLM (compat)")
+        except Exception as _e:
+            lf_handler = None
+            print(f"⚠️ Langfuse deshabilitado (no se pudo importar CallbackHandler): {_e}")
 
 # --- 2. Supervisor y Enrutador ---
+# Eliminado CHECKPOINT_NS; no se usa con MemorySaver
 
 class Route(PydanticBaseModel):
     """Decide a qué nodo dirigir la conversación a continuación."""
@@ -36,8 +62,9 @@ class Route(PydanticBaseModel):
 
 # Permite configurar el modelo por variable de entorno (p. ej., OPENAI_CHAT_MODEL=gpt-4.1-nano)
 model_name = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
-llm = ChatOpenAI(model=model_name, temperature=0)
-print(f"⚙️ Modelo OpenAI activo: {model_name}")
+# No pasar temperature explícito: algunos modelos (nano) solo soportan el valor por defecto
+llm = ChatOpenAI(model=model_name, callbacks=[lf_handler] if lf_handler else None)
+print(f"⚙️ Modelo OpenAI activo: {model_name} (Temperatura: default)")
 structured_llm_router = llm.with_structured_output(Route)
 
 # Utilidad para extraer un mensaje final útil del grafo
@@ -54,6 +81,26 @@ def _extract_final_ai_content(messages: List[BaseMessage]) -> Optional[str]:
             last_ai_with_tools = msg
     return getattr(last_ai_with_tools, "content", None)
 
+
+async def _maybe_update_thread_summary(organization_id: str, chat_identity_id: str, last_messages: List[Dict[str, Any]]):
+    """Genera y guarda un resumen del hilo cuando hay suficiente contexto.
+    Estrategia simple: si hay >= 8 mensajes recientes, generar resumen breve.
+    """
+    try:
+        if len(last_messages) < 8:
+            return
+        # Construir texto base
+        joined = "\n".join([f"{m.get('role')}: {m.get('content','')[:400]}" for m in last_messages][-20:])
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "Resume de forma breve y factual la conversación, destacando: intención, datos clave (fechas/horas/servicio), decisiones y próximos pasos. Máx 120-160 palabras."),
+            ("user", joined),
+        ])
+        summary = (await (prompt | llm).ainvoke({})).content
+        if summary:
+            await sb_upsert_thread_summary(organization_id, chat_identity_id, summary)
+    except Exception as e:
+        print(f"⚠️ No se pudo actualizar el resumen del hilo: {e}")
+
 supervisor_prompt = ChatPromptTemplate.from_messages(
     [
         ("system", """
@@ -65,14 +112,14 @@ Eres el supervisor de un sistema de agentes de IA para un centro de estética. T
 - `cancellation`: Si el usuario quiere cancelar o reprogramar una cita existente.
 - `confirmation`: Si el usuario quiere confirmar una cita ya programada.
 - `reschedule`: Si el usuario quiere reagendar/reprogramar/cambiar fecha u hora de una cita ya creada.
-- `escalation`: Si el usuario está frustrado, pide hablar con un humano o el sistema falla repetidamente.
+- `escalation`: Si el usuario está frustrado, pide hablar con un asesor o el sistema falla repetidamente.
 - `__end__`: Únicamente para despedidas explícitas (ej. "adiós", "chao") o cuando la conversación ha concluido.
 
-**Contexto de Zep (Memoria a Largo Plazo):**
-{zep_context}
+**Contexto (Memoria persistente):**
+{context_block}
 **Últimos mensajes (Memoria a Corto Plazo):**
 {messages}
-Basado en el **último mensaje del usuario** y el contexto de Zep, decide el siguiente nodo."""),
+Basado en el **último mensaje del usuario** y el contexto, decide el siguiente nodo."""),
         ("user", "{last_message}"),
     ]
 )
@@ -87,7 +134,7 @@ async def supervisor_node(state: GlobalState) -> Dict[str, Any]:
     last_message = state["messages"][-1].content
     chain = supervisor_prompt | structured_llm_router
     route = await chain.ainvoke({
-        "zep_context": state.get("zep_context", "No hay resumen."),
+        "context_block": state.get("context_block", "No hay resumen."),
         "messages": "\n".join([f"{type(m).__name__}: {m.content}" for m in state["messages"][-6:]]),
         "last_message": last_message,
     })
@@ -115,7 +162,7 @@ knowledge_agent_prompt = ChatPromptTemplate.from_messages(
 3.  **Si el historial ya contiene un `ToolMessage`**, normalmente basarás tu respuesta en ese resultado; **PERO** si la nueva pregunta se refiere a un **servicio diferente** al del último resultado (por nombre o sinónimos evidentes), realiza **una nueva llamada** a `knowledge_search` para ese servicio antes de responder.
 4.  **NO sugieras agendar una cita.** Tu trabajo es solo informar.
 
-**Contexto de Zep:** {zep_context}
+**Contexto:** {context_block}
 
 **Variables para herramientas (multitenancy):**
 - organization_id: {organization_id}
@@ -130,23 +177,24 @@ Al invocar herramientas, usa estos valores exactamente para los parámetros corr
 - Breve, claro y cercano en español neutro, usando tuteo.
 - Incluye 1–2 emojis sutiles y pertinentes al tema (p. ej., 🙂, 💡, 📌). No abuses.
 - Usa listas cuando presentes varias opciones o pasos.
-- Mantén un tono empático y humano.
+- Mantén un tono empático.
 
-**Regla de relevancia y escalamiento:**
+**Regla de relevancia, errores y escalamiento:**
 - Después de usar `knowledge_search`, responde únicamente si la información encontrada responde directamente a la pregunta del usuario (relevancia alta y explícita).
-- Si los resultados no responden claramente (o son tangenciales), indica que no encontraste información relevante sobre esa pregunta, ofrece reformular o, si el usuario lo desea, propone hablar con un asesor humano. Si el usuario acepta, dirígete al nodo de `escalation`.
+- Si hay un error técnico al usar una herramienta o no puedes completar la acción, informa brevemente el problema y ofrece hablar con un asesor. Si el usuario acepta, llama a la herramienta `escalate_to_human(reason=...)`.
+- Si los resultados no responden claramente (o son tangenciales), indica que no encontraste información relevante sobre esa pregunta, ofrece reformular o, si el usuario lo desea, propone hablar con un asesor. Si el usuario acepta, llama a `escalate_to_human`.
 """
         ),
         MessagesPlaceholder(variable_name="messages"),
     ]
 )
-knowledge_agent_runnable = knowledge_agent_prompt | llm.bind_tools([knowledge_search])
+knowledge_agent_runnable = knowledge_agent_prompt | llm.bind_tools([knowledge_search, escalate_to_human])
 
 async def knowledge_node(state: GlobalState) -> Dict[str, Any]:
     print("--- 📚 NODO: Conocimiento (Informativo) ---")
     response = await knowledge_agent_runnable.ainvoke(
         {
-            "zep_context": state.get("zep_context", "No hay resumen."),
+            "context_block": state.get("context_block", "No hay resumen."),
             "messages": state["messages"],
             "organization_id": state.get("organization_id"),
             "contact_id": state.get("contact_id"),
@@ -221,7 +269,7 @@ appointment_agent_prompt = ChatPromptTemplate.from_messages(
 - Fecha: {selected_date}
 - Hora: {selected_time}
  - Slots disponibles cargados: {available_slots}
-**Contexto Zep:** {zep_context}
+**Contexto:** {context_block}
 
 **Variables para herramientas (multitenancy):**
 - organization_id: {organization_id}
@@ -273,7 +321,7 @@ async def appointment_node(state: GlobalState) -> Dict[str, Any]:
             "selected_date": state.get("selected_date"),
             "selected_time": state.get("selected_time"),
             "available_slots": state.get("available_slots"),
-            "zep_context": state.get("zep_context", "No hay resumen."),
+            "context_block": state.get("context_block", "No hay resumen."),
             "messages": state["messages"],
             "organization_id": state.get("organization_id"),
             "contact_id": state.get("contact_id"),
@@ -316,6 +364,9 @@ Eres un asistente para cancelar citas. Flujo inteligente:
 
 Responde breve y en segunda persona. No inventes datos. Usa herramientas cuando corresponda.
 
+Manejo de errores:
+- Si alguna herramienta falla o devuelve un error, informa que no pudiste completar la cancelación en este momento y ofrece hablar con un asesor. Si el usuario acepta, llama a `escalate_to_human(reason=...)`.
+
 **Estilo de comunicación:**
 - Empático y claro, con 1–2 emojis sutiles (p. ej., 🗓️, ⚠️, ✅). No abuses.
 - Propón opciones concretas para facilitar la elección.
@@ -327,15 +378,19 @@ Responde breve y en segunda persona. No inventes datos. Usa herramientas cuando 
 """),
         MessagesPlaceholder("messages")
     ])
-    tools_for_cancel = [resolve_contact_on_booking, link_chat_identity_to_contact, resolve_relative_date, find_appointment_for_cancellation, get_upcoming_user_appointments, cancel_appointment]
+    tools_for_cancel = [resolve_relative_date, find_appointment_for_cancellation, get_upcoming_user_appointments, cancel_appointment, escalate_to_human]
+    # Gating dinámico: solo exponer resolución de contacto si no hay contact_id
+    if not state.get("contact_id"):
+        tools_for_cancel = [resolve_contact_on_booking, link_chat_identity_to_contact] + tools_for_cancel
     runnable = prompt | llm.bind_tools(tools_for_cancel)
-    print("[cancel] Últimos mensajes:")
-    try:
-        for m in state["messages"][-6:]:
-            role = type(m).__name__
-            print(f"  - {role}: {getattr(m, 'content', '')[:200]}")
-    except Exception:
-        pass
+    if os.getenv("LOG_VERBOSE", "false").lower() in ("1", "true", "yes"):
+        print("[cancel] Últimos mensajes:")
+        try:
+            for m in state["messages"][-6:]:
+                role = type(m).__name__
+                print(f"  - {role}: {getattr(m, 'content', '')[:200]}")
+        except Exception:
+            pass
     response = await runnable.ainvoke({
         "messages": state["messages"],
         "organization_id": state.get("organization_id"),
@@ -368,7 +423,10 @@ Eres un asistente para confirmar citas. Flujo inteligente:
    - >1 resultado: pide la hora exacta para desambiguar.
 3) Tras confirmar, responde con un mensaje de confirmación con fecha y hora.
 
-Responde breve, humano y con 1 emoji sutil.
+Responde breve y con 1 emoji sutil.
+
+Manejo de errores:
+- Si alguna herramienta falla o devuelve un error, informa que no pudiste completar la confirmación y ofrece hablar con un asesor. Si el usuario acepta, llama a `escalate_to_human(reason=...)`.
 
 **Resolución de contacto (multitenancy):**
 - Si `contact_id` es NULO, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener/crear el contacto en CRM y usar su `contact_id` en las demás herramientas.
@@ -377,15 +435,18 @@ Responde breve, humano y con 1 emoji sutil.
 """),
         MessagesPlaceholder("messages")
     ])
-    tools_for_confirm = [resolve_contact_on_booking, link_chat_identity_to_contact, resolve_relative_date, find_appointment_for_update, get_upcoming_user_appointments, confirm_appointment]
+    tools_for_confirm = [resolve_relative_date, find_appointment_for_update, get_upcoming_user_appointments, confirm_appointment, escalate_to_human]
+    if not state.get("contact_id"):
+        tools_for_confirm = [resolve_contact_on_booking, link_chat_identity_to_contact] + tools_for_confirm
     runnable = prompt | llm.bind_tools(tools_for_confirm)
-    print("[confirm] Últimos mensajes:")
-    try:
-        for m in state["messages"][-6:]:
-            role = type(m).__name__
-            print(f"  - {role}: {getattr(m, 'content', '')[:200]}")
-    except Exception:
-        pass
+    if os.getenv("LOG_VERBOSE", "false").lower() in ("1", "true", "yes"):
+        print("[confirm] Últimos mensajes:")
+        try:
+            for m in state["messages"][-6:]:
+                role = type(m).__name__
+                print(f"  - {role}: {getattr(m, 'content', '')[:200]}")
+        except Exception:
+            pass
     response = await runnable.ainvoke({
         "messages": state["messages"],
         "organization_id": state.get("organization_id"),
@@ -418,6 +479,9 @@ Eres un asistente para reagendar citas. Flujo:
 
 Sé claro y breve, con 1 emoji.
 
+Manejo de errores:
+- Si alguna herramienta falla o devuelve un error, informa que no pudiste completar el reagendamiento y ofrece hablar con un asesor. Si el usuario acepta, llama a `escalate_to_human(reason=...)`.
+
 **Resolución de contacto (multitenancy):**
 - Si `contact_id` es NULO, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener/crear el contacto en CRM y usar su `contact_id` en las demás herramientas.
 - Si `contact_id` YA existe, NO llames `resolve_contact_on_booking` ni indiques que vas a verificar el contacto.
@@ -425,15 +489,18 @@ Sé claro y breve, con 1 emoji.
 """),
         MessagesPlaceholder("messages")
     ])
-    tools_for_res = [resolve_contact_on_booking, link_chat_identity_to_contact, resolve_relative_date, find_appointment_for_update, get_upcoming_user_appointments, check_availability, select_appointment_slot, reschedule_appointment]
+    tools_for_res = [resolve_relative_date, find_appointment_for_update, get_upcoming_user_appointments, check_availability, select_appointment_slot, reschedule_appointment, escalate_to_human]
+    if not state.get("contact_id"):
+        tools_for_res = [resolve_contact_on_booking, link_chat_identity_to_contact] + tools_for_res
     runnable = prompt | llm.bind_tools(tools_for_res)
-    print("[reschedule] Últimos mensajes:")
-    try:
-        for m in state["messages"][-6:]:
-            role = type(m).__name__
-            print(f"  - {role}: {getattr(m, 'content', '')[:200]}")
-    except Exception:
-        pass
+    if os.getenv("LOG_VERBOSE", "false").lower() in ("1", "true", "yes"):
+        print("[reschedule] Últimos mensajes:")
+        try:
+            for m in state["messages"][-6:]:
+                role = type(m).__name__
+                print(f"  - {role}: {getattr(m, 'content', '')[:200]}")
+        except Exception:
+            pass
     response = await runnable.ainvoke({
         "messages": state["messages"],
         "organization_id": state.get("organization_id"),
@@ -571,8 +638,35 @@ workflow.add_edge("tools", "apply_tool_effects")
 workflow.add_edge("apply_tool_effects", "supervisor")
 
 # --- 5. Compilación y FastAPI ---
-memory_saver = MemorySaver()
-app_graph = workflow.compile(checkpointer=memory_saver)
+# Eliminado redis_url; no se usa checkpointer Redis
+
+# La app FastAPI y estados de runtime
+app = FastAPI()
+
+class MessageSerializer:
+    def dumps(self, obj):
+        return json.dumps(dumps(obj), ensure_ascii=False)
+
+    def loads(self, s):
+        return loads(json.loads(s))
+
+@app.on_event("startup")
+async def on_startup():
+    # Usar siempre MemorySaver como checkpointer
+    app.state.checkpointer = MemorySaver()
+    print("🧠 Checkpointer en memoria (MemorySaver)")
+    # Compilar el grafo con el checkpointer elegido
+    app.state.app_graph = workflow.compile(checkpointer=app.state.checkpointer)
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    # Cerrar el context manager si existe
+    _cm = getattr(app.state, "_cp_cm", None)
+    if _cm is not None:
+        try:
+            await _cm.__aexit__(None, None, None)
+        except Exception:
+            pass
 
 class InvokePayload(BaseModel):
     organizationId: str
@@ -583,8 +677,9 @@ class InvokePayload(BaseModel):
     countryCode: str
     firstName: Optional[str] = None
     message: str
+    recentMessages: Optional[List[Dict[str, str]]] = None
 
-app = FastAPI()
+ # app ya fue creado arriba
 
 async def get_contact_data(contact_id: str, organization_id: str) -> Optional[Dict[str, Any]]:
     try:
@@ -626,27 +721,59 @@ async def invoke(payload: InvokePayload, request: Request):
                 first_name = contact_data.get("first_name", "Usuario")
                 last_name = contact_data.get("last_name", "")
 
-        await ensure_user_exists(user_id, first_name, last_name, "")
-        await ensure_thread_exists(session_id, user_id)
+        context_block = await sb_get_context_block(session_id)
+        # Preferir historial reciente enviado por el gateway (Redis) si existe; fallback a Supabase
+        recent_msgs = payload.recentMessages or []
+        if recent_msgs:
+            print(f"🗂️ Usando historial desde gateway (Redis): {len(recent_msgs)} mensajes")
+            sb_history = recent_msgs[-6:]
+        else:
+            sb_history = await sb_get_last_messages(session_id, last_n=6)
         
-        from zep_cloud import Message
-        await add_messages_to_zep(session_id, [Message(role="user", content=payload.message)])
+        # Normalizador robusto usando deserialización oficial de LangChain
+        from langchain_core.messages import HumanMessage, AIMessage
+        from langchain_core.load import loads
+        def normalize_to_message(m: Dict[str, Any]):
+            # Caso 1: formato esperado { role, content }
+            if isinstance(m, dict) and 'role' in m and 'content' in m:
+                return AIMessage(content=m['content']) if m['role'] == 'assistant' else HumanMessage(content=m['content'])
+            # Caso 2: dict serializado de LangChain ({ lc, type, id, kwargs: { content, type } })
+            if isinstance(m, dict) and 'lc' in m and 'kwargs' in m:
+                try:
+                    # Usar deserialización oficial de LangChain
+                    return loads(m)
+                except Exception as e:
+                    print(f"⚠️ Error deserializando mensaje LangChain: {e}")
+                    # Fallback manual
+                    content = m['kwargs'].get('content', '')
+                    msg_type = m['kwargs'].get('type', 'human')
+                    return AIMessage(content=content) if msg_type == 'ai' else HumanMessage(content=content)
+            # Fallback: tratar como humano
+            return HumanMessage(content=str(m))
 
-        zep_context = await get_zep_context_block(session_id, mode="basic")
-        zep_history = await get_zep_last_messages(session_id, last_n=3)
+        conversation_history = [normalize_to_message(m) for m in sb_history]
+        # Evitar duplicar el último mensaje humano si ya viene en el historial
+        if not (
+            conversation_history
+            and isinstance(conversation_history[-1], HumanMessage)
+            and conversation_history[-1].content == payload.message
+        ):
+            conversation_history.append(HumanMessage(content=payload.message))
         
-        # Compatibilidad v2→v3: role_type→role, role→name
-        def _to_message(msg):
-            role = getattr(msg, 'role', None) or getattr(msg, 'role_type', None)
-            content = getattr(msg, 'content', '')
-            if role in ('assistant', 'ai'):
-                return AIMessage(content=content)
-            return HumanMessage(content=content)
+        # Debug: verificar que todos los mensajes son objetos Message válidos
+        if os.getenv("LOG_VERBOSE", "false").lower() in ("1", "true", "yes"):
+            print(f"🔍 Debug historial: {len(conversation_history)} mensajes")
+            for i, msg in enumerate(conversation_history):
+                print(f"  [{i}] {type(msg).__name__}: {msg.content[:50]}...")
 
-        conversation_history = [_to_message(msg) for msg in zep_history]
-        conversation_history.append(HumanMessage(content=payload.message))
+        # Usar un namespace de checkpoint para evitar conflictos con estados previos incompatibles
+        config = {
+            "configurable": {"thread_id": session_id},
+            "run_name": f"skytide_agent_{payload.organizationId}",
+            "tags": [f"org:{payload.organizationId}", f"chat:{session_id}"]
+        }
 
-        config = {"configurable": {"thread_id": session_id}}
+        # Eliminada validación/limpieza de estado Redis; con MemorySaver no aplica
         initial_state = GlobalState(
             messages=conversation_history,
             organization_id=payload.organizationId,
@@ -655,10 +782,13 @@ async def invoke(payload: InvokePayload, request: Request):
             phone=payload.phone,
             phone_number=payload.phoneNumber,
             country_code=payload.countryCode,
-            zep_context=zep_context,
+            context_block=context_block,
         )
         
-        final_state_result = await app_graph.ainvoke(initial_state, {**config, "recursion_limit": 50})
+        # Ejecución asíncrona con checkpointer
+        final_state_result = await app.state.app_graph.ainvoke(
+            initial_state, {**config, "recursion_limit": 50}
+        )
 
         ai_response_content = "No pude procesar tu solicitud."
         if final_state_result and final_state_result.get("messages"):
@@ -667,10 +797,10 @@ async def invoke(payload: InvokePayload, request: Request):
             if extracted.strip():
                 ai_response_content = extracted
             else:
-                # Fallback adicional
-            last_message = final_state_result["messages"][-1]
+                # Fallback adicional si no hay contenido directo
+                last_message = final_state_result["messages"][-1]
                 if isinstance(last_message, AIMessage):
-                ai_response_content = last_message.content
+                    ai_response_content = last_message.content
 
         # Log de salida del grafo
         try:
@@ -685,7 +815,12 @@ async def invoke(payload: InvokePayload, request: Request):
         except Exception:
             pass
 
-        await add_messages_to_zep(session_id, [Message(role="assistant", content=ai_response_content)])
+        # Intentar actualizar el resumen del hilo de forma asíncrona (best-effort)
+        try:
+            last_msgs = await sb_get_last_messages(session_id, last_n=12)
+            await _maybe_update_thread_summary(payload.organizationId, session_id, last_msgs)
+        except Exception:
+            pass
         return {"response": ai_response_content}
 
     except Exception as e:
