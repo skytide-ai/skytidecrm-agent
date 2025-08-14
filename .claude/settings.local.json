@@ -3,7 +3,8 @@
     "allow": [
       "mcp__context7-win__resolve-library-id",
       "mcp__context7-win__get-library-docs",
-      "Bash(docker-compose logs:*)"
+      "Bash(docker-compose logs:*)",
+      "WebSearch"
     ],
     "defaultMode": "acceptEdits"
   },

@@ -903,6 +903,7 @@ all_tools = [
     find_appointment_for_cancellation,
     find_appointment_for_update,
     confirm_appointment,
+    reschedule_appointment,  # Agregada para permitir reagendamiento
     resolve_contact_on_booking,
     check_availability,
     book_appointment,

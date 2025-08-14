@@ -635,7 +635,8 @@ Manejo de errores:
     # Si el usuario confirma explícitamente una hora presente en available_slots, el agente DEBE seleccionar ese slot en vez de escalar o confirmar
     # Gating: permitir reschedule_appointment solo cuando haya fecha/hora/miembro y cita identificada
     if (
-        state.get("selected_date") and state.get("selected_time") and (state.get("focused_appointment") or state.get("service_id"))
+        state.get("selected_date") and state.get("selected_time") and state.get("selected_member_id") and 
+        (state.get("focused_appointment") or state.get("service_id"))
     ):
         tools_for_res.append(reschedule_appointment)
     runnable = prompt | llm.bind_tools(tools_for_res)
@@ -648,7 +649,7 @@ Manejo de errores:
         except Exception:
             pass
     # Debug: mostrar el estado actual de los slots
-    print(f"[reschedule] Estado actual - available_slots: {len(state.get('available_slots') or [])} slots, selected_date: {state.get('selected_date')}, service_id: {state.get('service_id')}, focused_appointment: {bool(state.get('focused_appointment'))}")
+    print(f"[reschedule] Estado actual - available_slots: {len(state.get('available_slots') or [])} slots, selected_date: {state.get('selected_date')}, selected_time: {state.get('selected_time')}, selected_member_id: {state.get('selected_member_id')}, service_id: {state.get('service_id')}, focused_appointment: {bool(state.get('focused_appointment'))}")
     print(f"[reschedule] Herramientas disponibles: {[t.__name__ if hasattr(t, '__name__') else str(t) for t in tools_for_res]}")
     
     response = await runnable.ainvoke({
@@ -754,9 +755,36 @@ async def apply_tool_effects(state: GlobalState) -> Dict[str, Any]:
                 payload = json.loads(last_msg.content)
                 print(f"🔧 Payload decodificado desde JSON string")
             except json.JSONDecodeError:
-                # Si falla, es probable que sea un string plano, lo ignoramos para efectos de estado
-                print("🔧 No se pudo decodificar JSON del string")
-                return {}
+                # Podría ser un string Pydantic, intentar parsear
+                content_str = str(last_msg.content)
+                if "success=" in content_str and "message=" in content_str:
+                    # Es un objeto Pydantic serializado, extraer campos
+                    print("🔧 Detectado formato Pydantic, parseando campos...")
+                    payload = {}
+                    import re
+                    # Parsear campos del formato Pydantic
+                    for match in re.finditer(r"(\w+)=(['\"])([^'\"]*)\2|(\w+)=(True|False|None|\d+)", content_str):
+                        if match.group(1):  # Campo con string
+                            payload[match.group(1)] = match.group(3)
+                        elif match.group(4):  # Campo booleano/None/número
+                            value = match.group(5)
+                            if value == "True":
+                                payload[match.group(4)] = True
+                            elif value == "False":
+                                payload[match.group(4)] = False
+                            elif value == "None":
+                                payload[match.group(4)] = None
+                            else:
+                                payload[match.group(4)] = int(value) if value.isdigit() else value
+                    if payload:
+                        print(f"🔧 Payload parseado desde Pydantic: {json.dumps(payload, ensure_ascii=False)}")
+                    else:
+                        print("🔧 No se pudo parsear formato Pydantic")
+                        return {}
+                else:
+                    # Si falla, es probable que sea un string plano, lo ignoramos para efectos de estado
+                    print("🔧 No se pudo decodificar JSON del string")
+                    return {}
         # Si ya es dict o list, lo usamos directamente
         elif isinstance(last_msg.content, (dict, list)):
             payload = last_msg.content
@@ -814,9 +842,9 @@ async def apply_tool_effects(state: GlobalState) -> Dict[str, Any]:
             if payload.get("service_id"):
                 updates["service_id"] = payload["service_id"]
     elif tool_name == "select_appointment_slot" and isinstance(payload, dict):
-        if payload.get("success") is False:
-            updates["available_slots"] = None
-        else:
+        # NO eliminar available_slots cuando falla, el agente necesita intentar de nuevo
+        if payload.get("success") is not False:
+            # Solo actualizar si la selección fue exitosa
             if payload.get("selected_date"):
                 updates["selected_date"] = payload.get("selected_date")
             if payload.get("selected_time"):
@@ -1072,6 +1100,7 @@ async def invoke(payload: InvokePayload, request: Request):
                 "service_id": final_state_result.get("service_id"),
                 "selected_date": final_state_result.get("selected_date"),
                 "selected_time": final_state_result.get("selected_time"),
+                "selected_member_id": final_state_result.get("selected_member_id"),
                 "available_slots_len": len(final_state_result.get("available_slots") or [])
             }, ensure_ascii=False))
         except Exception:
