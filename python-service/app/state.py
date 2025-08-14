@@ -19,6 +19,9 @@ class GlobalState(TypedDict):
     service_name: Optional[str] = None
     requires_assessment: Optional[bool] = None
     available_slots: Optional[List[Dict[str, Any]]] = None
+    selected_date: Optional[str] = None
+    selected_time: Optional[str] = None
+    selected_member_id: Optional[str] = None
     appointment_date_query: Optional[str] = None
     focused_appointment: Optional[dict] = None
     ready_to_book: Optional[bool] = None

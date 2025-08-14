@@ -14,7 +14,7 @@ const DEDUP_TTL = 5 * 60 * 1000; // 5 minutos
 
 // Buffer de mensajes por chat (debounce)
 const pendingByChat = new Map(); // key: `${org}:${chatIdentityId}` -> { items: string[], timer: NodeJS.Timeout|null, ctx: object }
-const DEBOUNCE_MS = 10_000;
+const DEBOUNCE_MS = parseInt(process.env.GATEWAY_DEBOUNCE_MS || '10000', 10);
 const MAX_BATCH = 5;
 
 // Redis: cache de últimos N mensajes por chat
@@ -95,7 +95,7 @@ async function flushBuffer(chatKey) {
         : []
     };
     console.log(`📝 [${chatKey}] PAYLOAD invoke: ${JSON.stringify(payload)}`);
-    const responseFromPython = await axios.post(pythonServiceUrl, payload, { timeout: 60000 });
+    const responseFromPython = await axios.post(pythonServiceUrl, payload, { timeout: 120000 });
     const aiResponse = responseFromPython.data?.response || 'Sin respuesta';
     console.log(`🔵 [${chatKey}] FLUSH (${items.length} msgs) → RESPUESTA (${aiResponse?.length || 0} chars)`);
 

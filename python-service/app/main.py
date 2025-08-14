@@ -112,7 +112,7 @@ Eres el supervisor de un sistema de agentes de IA para un centro de estética. T
 - `cancellation`: Si el usuario quiere cancelar o reprogramar una cita existente.
 - `confirmation`: Si el usuario quiere confirmar una cita ya programada.
 - `reschedule`: Si el usuario quiere reagendar/reprogramar/cambiar fecha u hora de una cita ya creada.
-- `escalation`: Si el usuario está frustrado, pide hablar con un asesor o el sistema falla repetidamente.
+- `escalation`: Si el usuario explícitamente confirma que quiere hablar con un asesor (ej. "sí, quiero hablar con un asesor", "sí, por favor", "necesito ayuda humana").
 - `__end__`: Únicamente para despedidas explícitas (ej. "adiós", "chao") o cuando la conversación ha concluido.
 
 **Contexto (Memoria persistente):**
@@ -138,9 +138,34 @@ async def supervisor_node(state: GlobalState) -> Dict[str, Any]:
         "messages": "\n".join([f"{type(m).__name__}: {m.content}" for m in state["messages"][-6:]]),
         "last_message": last_message,
     })
-    print(f"🚦 Decisión del Supervisor: Ir a '{route.next}'")
+    # Heurística de persistencia de flujo: evita saltos accidentales al nodo de agendamiento
+    preferred_next = route.next
+    try:
+        current_flow = state.get("current_flow")
+        msg_lc = (last_message or "").lower()
+        if current_flow in ("confirmation", "cancellation", "reschedule"):
+            phrases_uncertain = [
+                "no recuerdo", "no me acuerdo", "no sé la fecha", "no se la fecha",
+                "no tengo la fecha", "no recuerdo la fecha", "no recuerdo la hora",
+                "no sé la hora", "no se la hora"
+            ]
+            if any(p in msg_lc for p in phrases_uncertain):
+                preferred_next = current_flow
+        # No saltar a appointment desde confirmation salvo intención explícita de agendar
+        if current_flow == "confirmation" and route.next == "appointment":
+            intent_schedule = ["agendar", "reservar", "programar", "quiero agendar", "quiero reservar"]
+            if not any(w in msg_lc for w in intent_schedule):
+                preferred_next = current_flow
+        # No saltar a confirmation desde reschedule por respuestas afirmativas genéricas
+        if current_flow == "reschedule" and route.next == "confirmation":
+            # En reagendamiento, NUNCA saltar al nodo de confirmación.
+            # La confirmación del nuevo horario se realiza dentro del propio flujo de reagendamiento con reschedule_appointment.
+            preferred_next = current_flow
+    except Exception:
+        pass
+    print(f"🚦 Decisión del Supervisor: Ir a '{preferred_next}'")
     # Guardamos el flujo actual para saber a dónde volver después de una herramienta
-    return {"next_agent": route.next, "current_flow": route.next}
+    return {"next_agent": preferred_next, "current_flow": preferred_next}
 
 # --- 3. Definición de Nodos de Lógica (Agentes Expertos) ---
 
@@ -162,6 +187,11 @@ knowledge_agent_prompt = ChatPromptTemplate.from_messages(
 3.  **Si el historial ya contiene un `ToolMessage`**, normalmente basarás tu respuesta en ese resultado; **PERO** si la nueva pregunta se refiere a un **servicio diferente** al del último resultado (por nombre o sinónimos evidentes), realiza **una nueva llamada** a `knowledge_search` para ese servicio antes de responder.
 4.  **NO sugieras agendar una cita.** Tu trabajo es solo informar.
 
+5.  Al invocar `knowledge_search`, NO agregues palabras clave adicionales ni entidades nuevas (p. ej., no agregues "SiluetSPA", "clínica estética", etc.).
+    - Puedes normalizar levemente el texto del usuario (minúsculas, quitar signos, corrección menor) o parafrasear de forma breve SIN introducir nuevos conceptos.
+    - Mantén el idioma original de la pregunta y su intención.
+    - Usa únicamente `{organization_id}` y, si aplica, `service_id` tal cual vengan en el contexto.
+
 **Contexto:** {context_block}
 
 **Variables para herramientas (multitenancy):**
@@ -179,16 +209,22 @@ Al invocar herramientas, usa estos valores exactamente para los parámetros corr
 - Usa listas cuando presentes varias opciones o pasos.
 - Mantén un tono empático.
 
+**Reglas de veracidad (obligatorias):**
+- No inventes información ni detalles que no estén en las fuentes o en el contexto.
+- No afirmes que realizaste acciones (reservas, confirmaciones, cambios) si no han ocurrido; en este nodo jamás se realizan acciones, solo se informa.
+- Si no estás seguro, pide aclarar o ofrece escalar con un asesor.
+
 **Regla de relevancia, errores y escalamiento:**
 - Después de usar `knowledge_search`, responde únicamente si la información encontrada responde directamente a la pregunta del usuario (relevancia alta y explícita).
-- Si hay un error técnico al usar una herramienta o no puedes completar la acción, informa brevemente el problema y ofrece hablar con un asesor. Si el usuario acepta, llama a la herramienta `escalate_to_human(reason=...)`.
-- Si los resultados no responden claramente (o son tangenciales), indica que no encontraste información relevante sobre esa pregunta, ofrece reformular o, si el usuario lo desea, propone hablar con un asesor. Si el usuario acepta, llama a `escalate_to_human`.
+- Si hay un error técnico al usar una herramienta o no puedes completar la acción, informa brevemente el problema y pregunta "¿Te gustaría hablar con un asesor?".
+- Si los resultados no responden claramente (o son tangenciales), indica que no encontraste información relevante sobre esa pregunta, ofrece reformular o preguntar "¿Te gustaría hablar con un asesor?".
+- Solo llama `escalate_to_human` DESPUÉS de que el usuario confirme explícitamente que quiere hablar con un asesor.
 """
         ),
         MessagesPlaceholder(variable_name="messages"),
     ]
 )
-knowledge_agent_runnable = knowledge_agent_prompt | llm.bind_tools([knowledge_search, escalate_to_human])
+knowledge_agent_runnable = knowledge_agent_prompt | llm.bind_tools([knowledge_search])
 
 async def knowledge_node(state: GlobalState) -> Dict[str, Any]:
     print("--- 📚 NODO: Conocimiento (Informativo) ---")
@@ -201,6 +237,7 @@ async def knowledge_node(state: GlobalState) -> Dict[str, Any]:
             "phone": state.get("phone"),
             "phone_number": state.get("phone_number"),
             "country_code": state.get("country_code"),
+            "chat_identity_id": state.get("chat_identity_id"),
         }
     )
     # Log de tool calls/respuesta
@@ -236,7 +273,6 @@ appointment_tools = [
     book_appointment,
     resolve_contact_on_booking,
     link_chat_identity_to_contact,
-    escalate_to_human,
     get_user_appointments,
     cancel_appointment,
 ]
@@ -248,8 +284,8 @@ appointment_agent_prompt = ChatPromptTemplate.from_messages(
 
 **FASE ACTUAL (revisa `service_id` para saber en qué fase estás):**
 - **FASE 1: Identificación (si `service_id` es NULO)**
-  1. Si el último mensaje del usuario SOLO expresa intención genérica (p. ej., "quiero agendar"), primero PREGUNTA de forma clara: "¿Qué servicio te gustaría agendar?". NO uses herramientas todavía.
-  2. Solo si el ÚLTIMO mensaje contiene palabras clave de un servicio (p. ej., "masaje", "limpieza facial"), usa `knowledge_search` para identificarlo y luego PIDE confirmación.
+  1. Si el último mensaje del usuario SOLO expresa intención genérica (p. ej., "quiero agendar"), primero PREGUNTA de forma clara: "¿Qué servicio te gustaría agendar?". NO uses herramientas todavía. No sugieras ejemplos ni inventes nombres de servicios.
+  2. Solo si el ÚLTIMO mensaje contiene un nombre explícito de un servicio, usa `knowledge_search` para identificarlo y luego PIDE confirmación. No propongas nombres de servicios por tu cuenta.
   3. Tras confirmación explícita del usuario, usa `update_service_in_state` para guardar el servicio.
 
 - **FASE 2: Reserva (si `service_id` YA EXISTE)**
@@ -258,6 +294,10 @@ appointment_agent_prompt = ChatPromptTemplate.from_messages(
   3. Nunca digas "no hay horarios" sin haber llamado antes a `check_availability` y sin haber verificado que la lista retornada esté vacía.
   4. Si el usuario expresa fechas relativas ("hoy", "mañana", "la otra semana", formatos DD/MM o DD-MM), primero usa `resolve_relative_date` con `timezone="America/Bogota"` para obtener `selected_date` en formato YYYY-MM-DD y luego llama a `check_availability`.
   5. Al llamar `select_appointment_slot` DEBES pasar el parámetro `available_slots` exactamente como fue devuelto por `check_availability`. Si `available_slots` está vacío o no existe, primero vuelve a ejecutar `check_availability` y recién después llama a `select_appointment_slot`.
+
+**Manejo de disponibilidad (sugerencias):**
+- Si el día no tiene disponibilidad, informa claramente que ese día no hay horarios y pide al usuario elegir otra fecha.
+- Si la hora pedida no está en `available_slots`, sugiere 3–5 horarios cercanos del mismo día usando `available_slots` y pide elegir uno de ellos.
 
 **Cambio de servicio (cuando ya hay `service_id`):**
 - Si el usuario menciona explícitamente otro servicio distinto al actual (por nombre o sinónimos) o rechaza el actual, primero CONFIRMA: "¿Deseas cambiar al servicio ‘X’?".
@@ -291,6 +331,12 @@ Si `resolve_contact_on_booking` devuelve que faltan nombres, PIDE nombre y apell
 - Usa 1–2 emojis sutiles y pertinentes, p. ej., 📅, 🙂, ✅, ⏰. No abuses.
 - Cuando pidas elegir fecha/hora, ofrece ejemplos o opciones concretas.
 - Confirma pasos importantes con frases breves.
+
+**Reglas de veracidad (obligatorias):**
+- No inventes horarios ni estados de reserva.
+- No afirmes que agendaste si no ejecutaste `book_appointment` con éxito.
+- Si no hay disponibilidad, dilo y ofrece alternativas.
+- No inventes ni sugieres nombres de servicios. Si el usuario no especifica, solo pregunta cuál desea.
 """
         ),
         MessagesPlaceholder(variable_name="messages"),
@@ -364,8 +410,13 @@ Eres un asistente para cancelar citas. Flujo inteligente:
 
 Responde breve y en segunda persona. No inventes datos. Usa herramientas cuando corresponda.
 
-Manejo de errores:
-- Si alguna herramienta falla o devuelve un error, informa que no pudiste completar la cancelación en este momento y ofrece hablar con un asesor. Si el usuario acepta, llama a `escalate_to_human(reason=...)`.
+ Manejo de errores:
+ - Si alguna herramienta falla o devuelve un error, informa que no pudiste completar la cancelación en este momento y pregunta "¿Te gustaría hablar con un asesor?".
+ - Solo llama `escalate_to_human` DESPUÉS de que el usuario confirme explícitamente que quiere hablar con un asesor.
+
+**Reglas de veracidad (obligatorias):**
+- No inventes estados de citas ni confirmes cancelaciones sin haber llamado `cancel_appointment` con éxito.
+- No digas que consultaste citas si no ejecutaste la herramienta correspondiente.
 
 **Estilo de comunicación:**
 - Empático y claro, con 1–2 emojis sutiles (p. ej., 🗓️, ⚠️, ✅). No abuses.
@@ -374,11 +425,14 @@ Manejo de errores:
 **Resolución de contacto (multitenancy):**
 - Si `contact_id` es NULO, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener/crear el contacto en CRM y usar su `contact_id` en las demás herramientas.
 - Si `contact_id` YA existe, NO llames `resolve_contact_on_booking` ni indiques que vas a verificar el contacto.
-- Si falta nombre/apellido, pídelos y vuelve a llamar pasando `first_name` y `last_name`. Luego, enlaza el contacto al hilo con `link_chat_identity_to_contact(chat_identity_id={chat_identity_id}, organization_id={organization_id}, contact_id=<id>)`.
+- Solo si la herramienta indica que faltan nombres (contacto inexistente), pide nombre y apellido al usuario y vuelve a llamar pasando `first_name` y `last_name` junto con `organization_id`, `phone_number` y `country_code` del contexto para CREAR el contacto. Luego, enlaza el contacto al hilo con `link_chat_identity_to_contact(chat_identity_id={chat_identity_id}, organization_id={organization_id}, contact_id=<id>)`.
+
+**Regla clave (teléfono):**
+- Nunca pidas el número de teléfono al usuario. Usa siempre `phone_number` y `country_code` del contexto para `resolve_contact_on_booking`.
 """),
         MessagesPlaceholder("messages")
     ])
-    tools_for_cancel = [resolve_relative_date, find_appointment_for_cancellation, get_upcoming_user_appointments, cancel_appointment, escalate_to_human]
+    tools_for_cancel = [resolve_relative_date, find_appointment_for_cancellation, get_upcoming_user_appointments, cancel_appointment]
     # Gating dinámico: solo exponer resolución de contacto si no hay contact_id
     if not state.get("contact_id"):
         tools_for_cancel = [resolve_contact_on_booking, link_chat_identity_to_contact] + tools_for_cancel
@@ -425,17 +479,25 @@ Eres un asistente para confirmar citas. Flujo inteligente:
 
 Responde breve y con 1 emoji sutil.
 
-Manejo de errores:
-- Si alguna herramienta falla o devuelve un error, informa que no pudiste completar la confirmación y ofrece hablar con un asesor. Si el usuario acepta, llama a `escalate_to_human(reason=...)`.
+ Manejo de errores:
+ - Si alguna herramienta falla o devuelve un error, informa que no pudiste completar la confirmación y pregunta "¿Te gustaría hablar con un asesor?".
+ - Solo llama `escalate_to_human` DESPUÉS de que el usuario confirme explícitamente que quiere hablar con un asesor.
+
+**Reglas de veracidad (obligatorias):**
+- No inventes estados ni confirmes citas si no llamaste `confirm_appointment` con éxito.
+- No digas que consultaste si no ejecutaste las herramientas correspondientes.
 
 **Resolución de contacto (multitenancy):**
 - Si `contact_id` es NULO, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener/crear el contacto en CRM y usar su `contact_id` en las demás herramientas.
 - Si `contact_id` YA existe, NO llames `resolve_contact_on_booking` ni indiques que vas a verificar el contacto.
-- Si la herramienta indica que faltan nombres, pide al usuario nombre y apellido, y vuelve a llamarla pasando `first_name` y `last_name`. Luego, enlaza el contacto al hilo con `link_chat_identity_to_contact(chat_identity_id={chat_identity_id}, organization_id={organization_id}, contact_id=<id>)`.
+- Solo si la herramienta indica que faltan nombres (contacto inexistente), pide nombre y apellido al usuario y vuelve a llamar pasando `first_name` y `last_name` junto con `organization_id`, `phone_number` y `country_code` del contexto para CREAR el contacto. Luego, enlaza el contacto al hilo con `link_chat_identity_to_contact(chat_identity_id={chat_identity_id}, organization_id={organization_id}, contact_id=<id>)`.
+
+**Regla clave (teléfono):**
+- Nunca pidas el número de teléfono al usuario. Usa siempre `phone_number` y `country_code` del contexto para `resolve_contact_on_booking`.
 """),
         MessagesPlaceholder("messages")
     ])
-    tools_for_confirm = [resolve_relative_date, find_appointment_for_update, get_upcoming_user_appointments, confirm_appointment, escalate_to_human]
+    tools_for_confirm = [resolve_relative_date, find_appointment_for_update, get_upcoming_user_appointments, confirm_appointment]
     if not state.get("contact_id"):
         tools_for_confirm = [resolve_contact_on_booking, link_chat_identity_to_contact] + tools_for_confirm
     runnable = prompt | llm.bind_tools(tools_for_confirm)
@@ -470,28 +532,68 @@ async def reschedule_node(state: GlobalState) -> Dict[str, Any]:
     print(f"[reschedule] contact_id actual: {state.get('contact_id')}")
     prompt = ChatPromptTemplate.from_messages([
         ("system", """
-Eres un asistente para reagendar citas. Flujo:
+Eres un asistente para reagendar citas. Sigue este orden ESTRICTO:
 
-1) Si el usuario no da fecha/hora nueva, pide la nueva fecha. Si es relativa, usa `resolve_relative_date` (America/Bogota) y guarda `selected_date`.
-2) Si el usuario conoce fecha/hora de la cita original: identifica la cita con `find_appointment_for_update(contact_id, old_date[, old_time])`. Si no la recuerda, ofrece listar con `get_upcoming_user_appointments(contact_id)`.
-3) Con la cita identificada, usa su `service_id` para calcular disponibilidad en la nueva fecha: `check_availability(service_id, organization_id, selected_date)` y muestra opciones. Tras elección, usa `select_appointment_slot`.
-4) Llama `reschedule_appointment(appointment_id, new_date, new_start_time, member_id, comment?)` y confirma el cambio.
+1) Ubicar la cita actual (obligatorio antes de pedir nueva fecha/hora):
+   - Si el usuario no recuerda, ofrece listar con `get_upcoming_user_appointments(contact_id)` y que elija.
+   - Si da fecha (y opcional hora), usa `find_appointment_for_update(contact_id, date[, time])`.
+   - Cuando haya exactamente una cita, considera la cita IDENTIFICADA.
+
+2) Pedir nueva fecha/hora:
+   - Una vez identificada la cita, **primero confirma con el usuario** la cita que se va a cambiar (ej: "Entendido, vamos a reagendar tu cita de [Servicio] para el [Fecha] a las [Hora].").
+   - **Inmediatamente después**, pregunta por la nueva fecha deseada (ej: "¿Para qué nueva fecha te gustaría moverla?").
+   - NO uses la fecha de la cita original para buscar disponibilidad. Debes obtener una fecha nueva del usuario.
+   - Cuando el usuario proporcione la nueva fecha, usa `resolve_relative_date` si es necesario, y luego `check_availability`.
+
+3) Ejecutar el cambio:
+   - Llama `reschedule_appointment(appointment_id, new_date, new_start_time, member_id, comment?)` y confirma.
 
 Sé claro y breve, con 1 emoji.
 
 Manejo de errores:
-- Si alguna herramienta falla o devuelve un error, informa que no pudiste completar el reagendamiento y ofrece hablar con un asesor. Si el usuario acepta, llama a `escalate_to_human(reason=...)`.
+- Si alguna herramienta falla o devuelve un error, informa que no pudiste completar el reagendamiento y pregunta "¿Te gustaría hablar con un asesor?". 
+- Solo llama `escalate_to_human` DESPUÉS de que el usuario confirme explícitamente que quiere hablar con un asesor.
 
 **Resolución de contacto (multitenancy):**
-- Si `contact_id` es NULO, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener/crear el contacto en CRM y usar su `contact_id` en las demás herramientas.
-- Si `contact_id` YA existe, NO llames `resolve_contact_on_booking` ni indiques que vas a verificar el contacto.
-- Si falta nombre/apellido, pídelos y vuelve a llamar pasando `first_name` y `last_name`. Luego, enlaza el contacto al hilo con `link_chat_identity_to_contact(chat_identity_id={chat_identity_id}, organization_id={organization_id}, contact_id=<id>)`.
+- Si `contact_id` es NULO, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})`.
+- Si `contact_id` YA existe, NO llames `resolve_contact_on_booking`.
+- Si falta nombre/apellido, pídelos y vuelve a llamar pasando `first_name` y `last_name`. Luego, enlaza con `link_chat_identity_to_contact(chat_identity_id={chat_identity_id}, organization_id={organization_id}, contact_id=<id>)`.
+
+**Regla clave (teléfono):**
+- Nunca pidas el número de teléfono al usuario. Usa `phone_number` y `country_code` del contexto.
+
+**Regla de slots:**
+- Ejecuta `check_availability` antes de `select_appointment_slot`.
+- Al llamar `select_appointment_slot`, pasa `available_slots` EXACTAMENTE como lo devolvió `check_availability`.
+- Si `available_slots` falta o está vacío, ejecuta `check_availability` y luego `select_appointment_slot`.
+
+**Falta de disponibilidad:**
+- Si el día no tiene horarios, dilo y pide otro día.
+- Si la hora pedida no está, sugiere 3–5 horarios cercanos del mismo día.
+
+**REGLA DE VERACIDAD (MUY IMPORTANTE):**
+- **NUNCA** confirmes un reagendamiento si la herramienta `reschedule_appointment` no ha sido llamada y ha devuelto `success: True`.
+- Es una falta grave inventar una confirmación. Si no estás seguro, informa que no pudiste completar la acción y pregunta si el usuario desea intentar de nuevo o hablar con un asesor.
 """),
         MessagesPlaceholder("messages")
     ])
-    tools_for_res = [resolve_relative_date, find_appointment_for_update, get_upcoming_user_appointments, check_availability, select_appointment_slot, reschedule_appointment, escalate_to_human]
+    # Base: localizar cita actual primero; no exponer disponibilidad hasta identificar
+    tools_for_res = [resolve_relative_date, find_appointment_for_update, get_upcoming_user_appointments]
+    # Habilitar resolución de contacto sólo si falta
     if not state.get("contact_id"):
         tools_for_res = [resolve_contact_on_booking, link_chat_identity_to_contact] + tools_for_res
+    # Exponer check_availability sólo si hay cita identificada (focused_appointment o service_id)
+    if state.get("focused_appointment") and state.get("selected_date"):
+        tools_for_res.append(check_availability)
+    # Exponer select_appointment_slot sólo si ya hay available_slots en el estado
+    if state.get("available_slots"):
+        tools_for_res.append(select_appointment_slot)
+    # Si el usuario confirma explícitamente una hora presente en available_slots, el agente DEBE seleccionar ese slot en vez de escalar o confirmar
+    # Gating: permitir reschedule_appointment solo cuando haya fecha/hora/miembro y cita identificada
+    if (
+        state.get("selected_date") and state.get("selected_time") and (state.get("focused_appointment") or state.get("service_id"))
+    ):
+        tools_for_res.append(reschedule_appointment)
     runnable = prompt | llm.bind_tools(tools_for_res)
     if os.getenv("LOG_VERBOSE", "false").lower() in ("1", "true", "yes"):
         print("[reschedule] Últimos mensajes:")
@@ -521,7 +623,50 @@ Manejo de errores:
 
 async def escalation_node(state: GlobalState) -> Dict[str, Any]:
     print("--- 🔴 NODO: Escalamiento ---")
-    return {"messages": [AIMessage(content="He notificado a un asesor para que se ponga en contacto contigo. En breve te contactaremos 🤝🙂")]}
+    print(f"[escalation] contact_id actual: {state.get('contact_id')}")
+    
+    # Prompt específico para el escalamiento
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", f"""
+Eres un asistente de escalamiento. El usuario ha solicitado hablar con un asesor humano o hay un problema que requiere intervención humana.
+
+Tu trabajo es:
+1. Confirmar la solicitud de escalamiento 
+2. Llamar a `escalate_to_human` con los datos del contexto
+3. Informar al usuario que un asesor ha sido notificado
+
+**Contexto del usuario:**
+- Organization ID: {{organization_id}}
+- Chat Identity ID: {{chat_identity_id}} 
+- Phone Number: {{phone_number}}
+- Country Code: {{country_code}}
+
+Responde de manera empática y profesional. Usa 1 emoji.
+"""),
+        MessagesPlaceholder("messages")
+    ])
+    
+    tools_for_escalation = [escalate_to_human]
+    runnable = prompt | llm.bind_tools(tools_for_escalation)
+    
+    response = await runnable.ainvoke({
+        "messages": state["messages"],
+        "organization_id": state.get("organization_id"),
+        "chat_identity_id": state.get("chat_identity_id"),
+        "phone_number": state.get("phone_number"),
+        "country_code": state.get("country_code"),
+    })
+    
+    try:
+        if isinstance(response, AIMessage) and getattr(response, "tool_calls", None):
+            calls_summary = [{"name": c.get("name"), "args": c.get("args")} for c in response.tool_calls]
+            print(f"🧰 (escalation) tool_calls: {json.dumps(calls_summary, ensure_ascii=False)}")
+        else:
+            print(f"🗣️ (escalation) respuesta directa: {getattr(response, 'content', '')[:300]}")
+    except Exception:
+        pass
+    
+    return {"messages": [response]}
 
 
 # --- 4. Construcción del Grafo ---
@@ -534,8 +679,6 @@ workflow.add_node("cancellation", cancellation_node)
 workflow.add_node("confirmation", confirmation_node)
 workflow.add_node("reschedule", reschedule_node)
 workflow.add_node("escalation", escalation_node)
-tool_node = ToolNode(all_tools)
-workflow.add_node("tools", tool_node)
 
 async def apply_tool_effects(state: GlobalState) -> Dict[str, Any]:
     """Aplica efectos en el estado a partir del último ToolMessage si es estructurado."""
@@ -546,23 +689,29 @@ async def apply_tool_effects(state: GlobalState) -> Dict[str, Any]:
     if not isinstance(last_msg, ToolMessage):
         return {}
 
+    payload = None
     try:
-        payload = json.loads(last_msg.content)
+        # Intentar decodificar si es un string JSON
+        if isinstance(last_msg.content, str):
+            try:
+                payload = json.loads(last_msg.content)
+            except json.JSONDecodeError:
+                # Si falla, es probable que sea un string plano, lo ignoramos para efectos de estado
+                return {}
+        # Si ya es dict o list, lo usamos directamente
+        elif isinstance(last_msg.content, (dict, list)):
+            payload = last_msg.content
+        else:
+            # Otros tipos no se procesan para efectos de estado
+            return {}
     except Exception:
-        # Algunas tools devuelven texto plano; no mutamos estado
         return {}
 
-    # Log básico del ToolMessage
-    try:
-        print(json.dumps({
-            "tool_name": getattr(last_msg, "name", None),
-            "raw_payload": payload if not isinstance(payload, list) else f"list[{len(payload)}]"
-        }, ensure_ascii=False))
-    except Exception:
-        pass
+    tool_name = getattr(last_msg, "name", None)
+    if not tool_name or payload is None:
+        return {}
 
     updates: Dict[str, Any] = {}
-    tool_name = getattr(last_msg, "name", None)
 
     # Manejo específico por herramienta
     if tool_name == "update_service_in_state" and isinstance(payload, dict):
@@ -582,13 +731,28 @@ async def apply_tool_effects(state: GlobalState) -> Dict[str, Any]:
         # Si resolvió/creó contacto, mantenerlo en estado para pasos siguientes
         if payload.get("success") and payload.get("contact_id"):
             updates["contact_id"] = payload.get("contact_id")
-    elif tool_name == "check_availability" and isinstance(payload, list):
-        # Guardar slots disponibles completos en estado
-        updates["available_slots"] = payload
-        print(f"📦 available_slots actualizados: {len(payload)}")
+    elif tool_name == "check_availability":
+        slots = []
+        if isinstance(payload, dict):
+            if payload.get("success") and "available_slots" in payload:
+                slots = payload["available_slots"]
+            else:
+                slots = payload.get("available_slots", [])
+        elif isinstance(payload, list):
+            slots = payload
+        updates["available_slots"] = slots
+        try:
+            print(f"📦 available_slots actualizados: {len(slots)}")
+        except Exception:
+            pass
+    elif tool_name == "find_appointment_for_update" and isinstance(payload, dict):
+        # Guardar cita enfocada y service_id para habilitar el resto del flujo
+        if payload.get("success") and (payload.get("appointment_id") or payload.get("candidates")):
+            updates["focused_appointment"] = payload
+            if payload.get("service_id"):
+                updates["service_id"] = payload["service_id"]
     elif tool_name == "select_appointment_slot" and isinstance(payload, dict):
         if payload.get("success") is False:
-            # No se encontró el slot; forzar recálculo de disponibilidad en el siguiente turno
             updates["available_slots"] = None
         else:
             if payload.get("selected_date"):
@@ -609,13 +773,41 @@ async def apply_tool_effects(state: GlobalState) -> Dict[str, Any]:
 
     return updates
 
-workflow.add_node("apply_tool_effects", apply_tool_effects)
+# Nuevo nodo que ejecuta la herramienta Y aplica sus efectos
+async def tool_executor_node(state: GlobalState) -> Dict[str, Any]:
+    """Ejecuta la herramienta y luego aplica sus efectos en el estado."""
+    print("--- ⚙️ NODO: Ejecutor de Herramientas ---")
+    
+    # 1. Ejecutar el ToolNode estándar para invocar la herramienta
+    tool_node = ToolNode(all_tools)
+    tool_result = await tool_node.ainvoke(state)
+    
+    # El resultado de ToolNode es un diccionario con 'messages': [ToolMessage]
+    # Lo fusionamos de nuevo al estado para que apply_tool_effects pueda leerlo
+    new_state_for_effects = state.copy()
+    new_state_for_effects["messages"] = list(new_state_for_effects["messages"]) + list(tool_result["messages"])
+    
+    # 2. Aplicar los efectos de la herramienta al estado
+    state_after_effects = await apply_tool_effects(new_state_for_effects)
+
+    # Devolvemos un diccionario que LangGraph puede fusionar de nuevo al estado principal
+    # Incluye tanto el ToolMessage como las actualizaciones de estado de apply_tool_effects
+    final_updates = {}
+    final_updates.update(tool_result) # {"messages": [ToolMessage(...)]}
+    final_updates.update(state_after_effects) # {"available_slots": [...]}
+    
+    return final_updates
+
+workflow.add_node("tools", tool_executor_node)
+
+
+# --- 5. Lógica de Enrutamiento (Edges) ---
 
 workflow.set_entry_point("supervisor")
 
 workflow.add_conditional_edges(
     "supervisor",
-    lambda state: state.get("next_agent"),
+    lambda state: state["next_agent"],
     {
         "knowledge": "knowledge",
         "appointment": "appointment",
@@ -634,10 +826,9 @@ workflow.add_conditional_edges("confirmation", decide_after_agent)
 workflow.add_conditional_edges("reschedule", decide_after_agent)
 workflow.add_conditional_edges("escalation", decide_after_agent)
 
-workflow.add_edge("tools", "apply_tool_effects")
-workflow.add_edge("apply_tool_effects", "supervisor")
+workflow.add_edge("tools", "supervisor")
 
-# --- 5. Compilación y FastAPI ---
+# --- 6. Compilación y FastAPI ---
 # Eliminado redis_url; no se usa checkpointer Redis
 
 # La app FastAPI y estados de runtime
@@ -774,16 +965,19 @@ async def invoke(payload: InvokePayload, request: Request):
         }
 
         # Eliminada validación/limpieza de estado Redis; con MemorySaver no aplica
-        initial_state = GlobalState(
-            messages=conversation_history,
-            organization_id=payload.organizationId,
-            chat_identity_id=payload.chatIdentityId,
-            contact_id=payload.contactId,
-            phone=payload.phone,
-            phone_number=payload.phoneNumber,
-            country_code=payload.countryCode,
-            context_block=context_block,
-        )
+        # Construir estado inicial sin sobreescribir `contact_id` si viene nulo
+        initial_state_data: Dict[str, Any] = {
+            "messages": conversation_history,
+            "organization_id": payload.organizationId,
+            "chat_identity_id": payload.chatIdentityId,
+            "phone": payload.phone,
+            "phone_number": payload.phoneNumber,
+            "country_code": payload.countryCode,
+            "context_block": context_block,
+        }
+        if payload.contactId:
+            initial_state_data["contact_id"] = payload.contactId
+        initial_state = GlobalState(**initial_state_data)
         
         # Ejecución asíncrona con checkpointer
         final_state_result = await app.state.app_graph.ainvoke(
@@ -817,8 +1011,14 @@ async def invoke(payload: InvokePayload, request: Request):
 
         # Intentar actualizar el resumen del hilo de forma asíncrona (best-effort)
         try:
-            last_msgs = await sb_get_last_messages(session_id, last_n=12)
-            await _maybe_update_thread_summary(payload.organizationId, session_id, last_msgs)
+            # Ejecutar de forma no bloqueante para no añadir latencia a la respuesta
+            async def _bg_update():
+                try:
+                    last_msgs = await sb_get_last_messages(session_id, last_n=12)
+                    await _maybe_update_thread_summary(payload.organizationId, session_id, last_msgs)
+                except Exception:
+                    pass
+            asyncio.create_task(_bg_update())
         except Exception:
             pass
         return {"response": ai_response_content}

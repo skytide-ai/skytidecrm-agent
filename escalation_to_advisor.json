@@ -1,0 +1,282 @@
+{
+  "name": "escalation_to_advisor",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "const botResult = $('Desactivar bot').first().json; \nconst success = botResult && botResult.id; \nconst inputData = $('Inputs').first().json; \nconst clientData = $('Obtener datos del cliente').first().json; \nconst clientName = clientData.contact_name || inputData.platform_user_id; \nconst clientPhone = clientData.phone || inputData.platform_user_id; \n\nreturn [{ \n  json: { \n    success: success, \n    message: success ? `Escalamiento exitoso. El caso de ${clientName} ha sido transferido al asesor y el bot ha sido desactivado.` : 'Error al procesar el escalamiento. No se pudo desactivar el bot.', \n    escalation: success ? { \n      client_name: clientName, \n      client_phone: clientPhone, \n      advisor_notified: true, \n      bot_disabled: true, \n      timestamp: new Date().toISOString() \n    } : null \n  } \n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2288,
+        400
+      ],
+      "id": "fa16e512-114f-4d8b-9898-bdefbb889089",
+      "name": "Formatear Respuesta"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE chat_identities \nSET bot_enabled = false, \n    last_seen = NOW()\nWHERE id = $1::uuid\nRETURNING \n  id,\n  platform_user_id,\n  bot_enabled;",
+        "options": {
+          "queryReplacement": "={{ $('Inputs').item.json.chat_identity_id }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2064,
+        400
+      ],
+      "id": "0c41414f-d396-4209-8239-caf8beb128bc",
+      "name": "Desactivar bot",
+      "credentials": {
+        "postgres": {
+          "id": "jENCN7npdjxaKb3f",
+          "name": "SupabaseCRM"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT \n  ci.platform_user_id,\n  ci.platform,\n  ci.organization_id,\n  ci.contact_id,\n  CASE \n    WHEN ci.contact_id IS NOT NULL THEN CONCAT(c.first_name, ' ', c.last_name)\n    ELSE NULL\n  END as contact_name,\n  c.phone,\n  CASE \n    WHEN ci.contact_id IS NOT NULL THEN 'with_contact'\n    ELSE 'without_contact'\n  END as client_type\nFROM chat_identities ci\nLEFT JOIN contacts c ON c.id = ci.contact_id\nWHERE ci.id = $1::uuid;",
+        "options": {
+          "queryReplacement": "={{ $json.chat_identity_id }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1408,
+        400
+      ],
+      "id": "000d86fc-3a00-4e65-8eb0-6ac424f7f9cb",
+      "name": "Obtener datos del cliente",
+      "credentials": {
+        "postgres": {
+          "id": "jENCN7npdjxaKb3f",
+          "name": "SupabaseCRM"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b1c0738e-c386-439e-948c-01f261ac3e44",
+              "name": "chat_identity_id",
+              "value": "={{ $json.query.chat_identity_id }}",
+              "type": "string"
+            },
+            {
+              "id": "bad39b1e-2f74-4e0f-8192-65080d354d9a",
+              "name": "platform_user_id",
+              "value": "={{ $json.query.platform_user_id }}",
+              "type": "string"
+            },
+            {
+              "id": "f029267a-5c3b-4726-bf57-641974d54ae0",
+              "name": "reason",
+              "value": "={{ $json.query.reason }}",
+              "type": "string"
+            },
+            {
+              "id": "b4eb1104-d33c-418d-9d2c-c2388dd8bd32",
+              "name": "organization_id",
+              "value": "={{ $json.query.organization_id }}",
+              "type": "string"
+            },
+            {
+              "id": "4a62fe5f-0c24-4c1f-8e89-1f5979d2c2fe",
+              "name": "advisor_phone",
+              "value": "={{ $json.query.advisor_phone }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1184,
+        400
+      ],
+      "id": "48179516-c846-4a53-8295-fea83e36ed2e",
+      "name": "Inputs"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "escalation_to_advisor",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        960,
+        400
+      ],
+      "id": "72c16725-86e9-4ff6-9530-03955fb2e97c",
+      "name": "Webhook",
+      "webhookId": "escalation-to-advisor-webhook"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.gupshup.io/wa/api/v1/template/msg",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "source",
+              "value": "573001384657"
+            },
+            {
+              "name": "destination",
+              "value": "={{ $json.advisor_phone }}"
+            },
+            {
+              "name": "template",
+              "value": "={\"id\": \"0420f88a-531f-4c3d-8893-81b08f1b1d6c\" , \"params\": {{ JSON.stringify($json.template_params) }}}"
+            },
+            {
+              "name": "channel",
+              "value": "whatsapp"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1840,
+        400
+      ],
+      "id": "b754bd72-fade-42e8-8235-0e131eb5bc33",
+      "name": "Enviar mensaje confirmación - Cancelación",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "AJibCbsmN6nBb5hH",
+          "name": "Gushup API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const clientData = $('Obtener datos del cliente').first().json;\nconst inputs = $('Inputs').first().json;\n\n// Datos del cliente\nconst phone = clientData.phone || inputs.platform_user_id;\nconst currentTime = new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota' });\n\n// Formatear campo de cliente de manera inteligente\nlet clientField;\nif (clientData.contact_name) {\n  // Si tiene contacto, mostrar nombre\n  clientField = clientData.contact_name;\n} else {\n  // Si no tiene contacto, mostrar número y nota\n  clientField = `${inputs.platform_user_id} ⚠️ (Sin contacto registrado)`;\n}\n\n// Parámetros para la plantilla\nconst templateParams = [\n  clientField,\n  phone,\n  inputs.reason,\n  currentTime\n];\n\nreturn [{\n  json: {\n    advisor_phone: inputs.advisor_phone,\n    client_phone: phone,\n    template_params: templateParams,\n    chat_identity_id: inputs.chat_identity_id\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1632,
+        400
+      ],
+      "id": "be9fb2ba-0950-48fc-9284-1e7e5ceb212d",
+      "name": "Code"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Desactivar bot": {
+      "main": [
+        [
+          {
+            "node": "Formatear Respuesta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Obtener datos del cliente": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inputs": {
+      "main": [
+        [
+          {
+            "node": "Obtener datos del cliente",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Inputs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "Enviar mensaje confirmación - Cancelación",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enviar mensaje confirmación - Cancelación": {
+      "main": [
+        [
+          {
+            "node": "Desactivar bot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "7bcd8765-5e22-4b37-821a-45e8b50c0e86",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "700c2e443791e53e878b08e72c6bad1a1bc46cc562c27751c060bd5b2ffb0536"
+  },
+  "id": "GHzVR9kMBxSjtWiW",
+  "tags": [
+    {
+      "createdAt": "2025-06-21T21:48:49.833Z",
+      "updatedAt": "2025-06-21T21:48:49.833Z",
+      "id": "D589C0lWtKnY44Gs",
+      "name": "AI Agent Tool"
+    }
+  ]
+}

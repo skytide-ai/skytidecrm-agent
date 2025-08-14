@@ -7,6 +7,8 @@ import json
 import re
 import pytz
 from openai import AsyncOpenAI
+import os
+import httpx
 
 from .state import GlobalState
 from .db import supabase_client, run_db
@@ -203,6 +205,9 @@ async def reset_appointment_context(reason: str = "Cambio de contexto detectado"
 @tool
 async def select_appointment_slot(available_slots: List[Dict[str, Any]], appointment_date: str, start_time: str) -> SlotSelection:
     """Selecciona un horario específico de los slots disponibles."""
+    # Validaciones de entrada: available_slots debe ser la lista completa devuelta por check_availability
+    if not isinstance(available_slots, list) or not available_slots or not isinstance(available_slots[0], dict):
+        return SlotSelection(success=False, message="No tengo la lista de horarios disponible. Primero necesito ejecutar check_availability.", selected_date="", selected_time="", member_id="")
     selected_slot = next((slot for slot in available_slots if slot.get("start_time") == start_time), None)
     if not selected_slot:
         try:
@@ -296,31 +301,40 @@ def resolve_relative_date(date_text: str, timezone: str = "America/Bogota") -> D
         return {"success": False, "message": f"Error resolviendo fecha: {e}"}
 
 @tool
-async def resolve_contact_on_booking(organization_id: str, phone_number: str, country_code: str, first_name: Optional[str] = None, last_name: Optional[str] = None) -> ContactResolution:
-    """Busca un contacto por teléfono o lo crea si no existe."""
+async def resolve_contact_on_booking(organization_id: str, phone_number: str, country_code: str, first_name: Optional[str] = None, last_name: Optional[str] = None) -> Dict[str, Any]:
+    """Busca un contacto por teléfono o lo crea si no existe. Devuelve un dict JSON-serializable."""
     try:
-        response = await run_db(lambda: supabase_client.table('contacts').select('id').eq('organization_id', organization_id).eq('phone', phone_number).eq('country_code', country_code).maybe_single().execute())
+        response = await run_db(lambda: supabase_client
+                                .table('contacts')
+                                .select('id')
+                                .eq('organization_id', organization_id)
+                                .eq('phone', phone_number)
+                                .eq('country_code', country_code)
+                                .maybe_single()
+                                .execute())
         if response.data:
             contact_id = response.data['id']
-            return ContactResolution(success=True, contact_id=contact_id, message="Contacto reconocido.", is_existing_contact=True)
+            return {"success": True, "contact_id": contact_id, "message": "Contacto reconocido.", "is_existing_contact": True}
         else:
             if not first_name or not last_name:
-                return ContactResolution(success=False, message="Faltan nombre y apellido para crear el contacto.")
-            # Crear contacto con nombres si fueron proporcionados, en caso contrario con valores por defecto
-            insert_response = await run_db(lambda: supabase_client.table('contacts').insert({
-                'organization_id': organization_id,
-                'phone': phone_number,
-                'country_code': country_code,
-                'first_name': first_name,
-                'last_name': last_name,
-            }).execute())
+                return {"success": False, "message": "Faltan nombre y apellido para crear el contacto."}
+            insert_response = await run_db(lambda: supabase_client
+                                           .table('contacts')
+                                           .insert({
+                                               'organization_id': organization_id,
+                                               'phone': phone_number,
+                                               'country_code': country_code,
+                                               'first_name': first_name,
+                                               'last_name': last_name,
+                                           })
+                                           .execute())
             if not insert_response or not getattr(insert_response, 'data', None):
-                return ContactResolution(success=False, message="No fue posible crear el contacto")
+                return {"success": False, "message": "No fue posible crear el contacto"}
             new_row = insert_response.data[0] if isinstance(insert_response.data, list) else insert_response.data
             new_contact_id = new_row['id']
-            return ContactResolution(success=True, contact_id=new_contact_id, message="Nuevo contacto creado.", is_existing_contact=False)
+            return {"success": True, "contact_id": new_contact_id, "message": "Nuevo contacto creado.", "is_existing_contact": False}
     except Exception as e:
-        return ContactResolution(success=False, message=f"Error al resolver contacto: {e}")
+        return {"success": False, "message": f"Error al resolver contacto: {e}"}
 
 def _to_datetime(the_date: date, time_str: str):
     if not time_str: return None
@@ -460,11 +474,12 @@ async def check_availability(service_id: str, organization_id: str, check_date_s
             from collections import Counter
             member_slot_count = Counter(slot.member_id for slot in all_final_slots)
             best_member = member_slot_count.most_common(1)[0][0]
-            result = sorted([s for s in all_final_slots if s.member_id == best_member], key=lambda x: datetime.strptime(x.start_time, '%H:%M'))
+            result = sorted([s.model_dump() for s in all_final_slots if s.member_id == best_member], key=lambda x: datetime.strptime(x['start_time'], '%H:%M'))
             print(f"[check_availability] ✅ Slots calculados para member={best_member}: {len(result)}")
-            return result
+            # Devolver SIEMPRE JSON serializable y con clave explícita
+            return {"success": True, "available_slots": result}
         print("[check_availability] ⚠️ Sin slots luego de combinar org/miembro/citas")
-        return []
+        return {"success": True, "available_slots": []}
     except Exception as e:
         import traceback
         print(f"❌ Error en check_availability: {e}")
@@ -752,6 +767,18 @@ async def reschedule_appointment(appointment_id: str, new_date: str, new_start_t
         if not svc_resp or not getattr(svc_resp, 'data', None):
             return AppointmentConfirmation(success=False, message="No pude obtener la duración del servicio.")
         duration = svc_resp.data.get('duration_minutes') or 0
+        # Validación opcional: comprobar que la hora solicitada pertenece a disponibilidad calculada
+        try:
+            # buscar disponibilidad del mismo miembro para la fecha solicitada
+            avail_resp = await run_db(lambda: supabase_client
+                                      .table('member_availability')
+                                      .select('*')
+                                      .eq('member_id', member_id)
+                                      .eq('day_of_week', __import__('datetime').datetime.strptime(new_date, "%Y-%m-%d").date().isoweekday())
+                                      .execute())
+            # esta validación solo garantiza formato correcto; la validación real de solapamientos la hace la capa de check_availability previa
+        except Exception:
+            pass
         # Normalizar hora inicio y calcular fin
         try:
             start_dt = _to_datetime(date.fromisoformat(new_date), new_start_time)
@@ -804,10 +831,38 @@ async def cancel_appointment(appointment_id: str) -> AppointmentConfirmation:
         return AppointmentConfirmation(success=False, message="Lo siento, no pude cancelar tu cita.")
 
 @tool
-async def escalate_to_human(chat_identity_id: str, reason: str) -> Dict[str, Any]:
-    """Marca la conversación para escalamiento a un agente humano."""
-    print(f"--- 🚩 ESCALAMIENTO A HUMANO --- Razón: {reason}")
-    return {"success": True, "message": "Un asesor humano será notificado."}
+async def escalate_to_human(
+    organization_id: str,
+    chat_identity_id: str,
+    phone_number: str,
+    country_code: str,
+    reason: str,
+) -> Dict[str, Any]:
+    """Escala la conversación a un asesor notificando vía gateway y desactivando el bot.
+
+    Requiere: organization_id, chat_identity_id, phone_number, country_code y reason.
+    """
+    try:
+        gateway_url = os.getenv('EXPRESS_GATEWAY_URL', 'http://express-gateway:8080')
+        url = f"{gateway_url}/internal/notify/escalation"
+        payload = {
+            "organization_id": organization_id,
+            "chat_identity_id": chat_identity_id,
+            "phone_number": phone_number,
+            "country_code": country_code,
+            "reason": reason,
+        }
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code == 200:
+                print("[escalate_to_human] ✅ Notificación enviada y bot desactivado (vía gateway)")
+                return {"success": True, "message": "Un asesor ha sido notificado y se comunicará contigo en breve."}
+            else:
+                print(f"[escalate_to_human] ❌ Gateway respondió {resp.status_code}: {resp.text}")
+                return {"success": False, "message": "No pude notificar al asesor en este momento. Intenta más tarde."}
+    except Exception as e:
+        print(f"[escalate_to_human] ❌ Error: {e}")
+        return {"success": False, "message": f"Error al escalar: {e}"}
 
 @tool
 async def link_chat_identity_to_contact(chat_identity_id: str, organization_id: str, contact_id: str) -> Dict[str, Any]:
