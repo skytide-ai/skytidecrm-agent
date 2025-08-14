@@ -474,7 +474,15 @@ async def check_availability(service_id: str, organization_id: str, check_date_s
             from collections import Counter
             member_slot_count = Counter(slot.member_id for slot in all_final_slots)
             best_member = member_slot_count.most_common(1)[0][0]
-            result = sorted([s.model_dump() for s in all_final_slots if s.member_id == best_member], key=lambda x: datetime.strptime(x['start_time'], '%H:%M'))
+            # Convertir UUIDs a strings para que sea JSON serializable
+            result = sorted([
+                {
+                    "start_time": s.start_time,
+                    "end_time": s.end_time,
+                    "member_id": str(s.member_id)  # Convertir UUID a string
+                }
+                for s in all_final_slots if s.member_id == best_member
+            ], key=lambda x: datetime.strptime(x['start_time'], '%H:%M'))
             print(f"[check_availability] ✅ Slots calculados para member={best_member}: {len(result)}")
             # Devolver SIEMPRE JSON serializable y con clave explícita
             return {"success": True, "available_slots": result}
@@ -492,11 +500,11 @@ async def book_appointment(organization_id: str, contact_id: str, service_id: st
     try:
         print(f"[book_appointment] ▶️ Inicio | org={organization_id}, contact_id={contact_id}, service_id={service_id}, member_id={member_id}, date={appointment_date}, time={start_time}")
         if not is_valid_uuid(organization_id):
-            return AppointmentConfirmation(success=False, message=f"organization_id inválido: {organization_id}")
+            return {"success": False, "message": f"organization_id inválido: {organization_id}"}
         service_response = await run_db(lambda: supabase_client.table('services').select('duration_minutes').eq('id', service_id).single().execute())
         if not service_response or not getattr(service_response, 'data', None):
             print(f"[book_appointment] ❌ Servicio no encontrado para id={service_id}")
-            return AppointmentConfirmation(success=False, message="No pude encontrar el servicio para agendar.")
+            return {"success": False, "message": "No pude encontrar el servicio para agendar."}
         duration_minutes = service_response.data['duration_minutes']
         print(f"[book_appointment] ⏱️ Duración del servicio: {duration_minutes} minutos")
         start_datetime = datetime.fromisoformat(f"{appointment_date}T{start_time}")
@@ -512,7 +520,7 @@ async def book_appointment(organization_id: str, contact_id: str, service_id: st
         response = await run_db(lambda: supabase_client.table('appointments').insert(appointment_data).execute())
         if not response or not getattr(response, 'data', None):
             print("[book_appointment] ❌ Insert no devolvió datos")
-            return AppointmentConfirmation(success=False, message="No pude confirmar la creación de la cita.")
+            return {"success": False, "message": "No pude confirmar la creación de la cita."}
         inserted_row = response.data[0] if isinstance(response.data, list) else response.data
         appointment_id = inserted_row['id']
         print(f"[book_appointment] ✅ Cita creada con id={appointment_id}")
@@ -528,12 +536,18 @@ async def book_appointment(organization_id: str, contact_id: str, service_id: st
         opt_in_status = auth_response.data['authorization_type'] if auth_response.data else "not_set"
         print(f"[book_appointment] 🔐 WhatsApp opt-in status: {opt_in_status}")
         
-        return AppointmentConfirmation(success=True, appointment_id=UUID(appointment_id), opt_in_status=opt_in_status, message=f"Cita agendada con éxito para el {appointment_date} a las {start_time}.")
+        # Retornar como dict para que sea JSON serializable
+        return {
+            "success": True,
+            "appointment_id": str(appointment_id),  # Convertir UUID a string
+            "opt_in_status": opt_in_status,
+            "message": f"Cita agendada con éxito para el {appointment_date} a las {start_time}."
+        }
     except Exception as e:
         import traceback
         print(f"❌ Error en book_appointment: {e}")
         traceback.print_exc()
-        return AppointmentConfirmation(success=False, message=f"Error al agendar la cita: {e}")
+        return {"success": False, "message": f"Error al agendar la cita: {e}"}
 
 @tool
 async def create_whatsapp_opt_in(

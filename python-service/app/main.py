@@ -129,6 +129,8 @@ async def supervisor_node(state: GlobalState) -> Dict[str, Any]:
     
     if isinstance(state["messages"][-1], ToolMessage):
         print(f"🚦 Devolviendo control a '{state['current_flow']}' tras ejecución de herramienta.")
+        # Debug: verificar si los slots están en el estado después de tools
+        print(f"🚦 Estado de slots en supervisor: {len(state.get('available_slots', []))} slots disponibles")
         return {"next_agent": state['current_flow']}
 
     last_message = state["messages"][-1].content
@@ -293,7 +295,11 @@ appointment_agent_prompt = ChatPromptTemplate.from_messages(
   2. Sigue estrictamente: Preguntar fecha -> `check_availability` (con `service_id`, `organization_id`, `check_date_str`) -> si hay slots, pedir hora y usar `select_appointment_slot` -> finalmente `book_appointment`.
   3. Nunca digas "no hay horarios" sin haber llamado antes a `check_availability` y sin haber verificado que la lista retornada esté vacía.
   4. Si el usuario expresa fechas relativas ("hoy", "mañana", "la otra semana", formatos DD/MM o DD-MM), primero usa `resolve_relative_date` con `timezone="America/Bogota"` para obtener `selected_date` en formato YYYY-MM-DD y luego llama a `check_availability`.
-  5. Al llamar `select_appointment_slot` DEBES pasar el parámetro `available_slots` exactamente como fue devuelto por `check_availability`. Si `available_slots` está vacío o no existe, primero vuelve a ejecutar `check_availability` y recién después llama a `select_appointment_slot`.
+  5. **IMPORTANTE**: Al llamar `select_appointment_slot` DEBES pasar TRES parámetros obligatorios:
+     - `appointment_date`: la fecha en formato YYYY-MM-DD
+     - `start_time`: la hora de inicio en formato HH:MM
+     - `available_slots`: DEBES pasar la lista completa de slots exactamente como la tienes en el estado (ver "Slots disponibles cargados" abajo)
+     Si `available_slots` está vacío o no existe, primero vuelve a ejecutar `check_availability` y recién después llama a `select_appointment_slot`.
 
 **Manejo de disponibilidad (sugerencias):**
 - Si el día no tiene disponibilidad, informa claramente que ese día no hay horarios y pide al usuario elegir otra fecha.
@@ -399,14 +405,20 @@ async def cancellation_node(state: GlobalState) -> Dict[str, Any]:
         ("system", """
 Eres un asistente para cancelar citas. Flujo inteligente:
 
+**PASO 0 - CRÍTICO: Resolver contacto si no existe**
+- Si `contact_id` es NULO o None, DEBES PRIMERO llamar a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener el UUID del contacto.
+- NUNCA uses el número de teléfono como contact_id. El contact_id es un UUID que obtienes de `resolve_contact_on_booking`.
+- Solo después de tener el contact_id UUID válido, procede con los siguientes pasos.
+
 1) Si el usuario NO menciona fecha: PIDE la fecha de la cita a cancelar. Ofrece listar citas futuras si no la recuerda.
-2) Si menciona fecha relativa (hoy/mañana/otra semana/DD/MM), usa la herramienta `resolve_relative_date` (America/Bogota) y guarda `selected_date`.
-3) Si hay `selected_date` pero NO hora, intenta `find_appointment_for_cancellation(contact_id, selected_date)`:
+2) **CRÍTICO**: Si menciona CUALQUIER fecha relativa (hoy, mañana, pasado mañana, esta semana, próxima semana, DD/MM, DD-MM), DEBES PRIMERO usar `resolve_relative_date(date_str="<exactamente lo que dijo el usuario>", timezone="America/Bogota")` para obtener `selected_date` en formato YYYY-MM-DD.
+   - NUNCA intentes adivinar fechas. SIEMPRE usa `resolve_relative_date` primero.
+3) Solo DESPUÉS de tener `selected_date` resuelto, si NO hay hora, intenta `find_appointment_for_cancellation(contact_id, selected_date)` usando el UUID:
    - 0 resultados: informa y ofrece listar próximas citas.
    - 1 resultado: PIDE confirmación para cancelar esa cita.
    - >1 resultado: PIDE la hora exacta para desambiguar.
 4) Si hay fecha y hora, llama `find_appointment_for_cancellation` con ambos y, si hay una sola, llama `cancel_appointment` y confirma.
-5) Si el usuario no recuerda fecha, usa `get_upcoming_user_appointments(contact_id)` para listar y pide que elija una.
+5) Si el usuario no recuerda fecha, usa `get_upcoming_user_appointments(contact_id)` con el UUID para listar y pide que elija una.
 
 Responde breve y en segunda persona. No inventes datos. Usa herramientas cuando corresponda.
 
@@ -470,9 +482,16 @@ async def confirmation_node(state: GlobalState) -> Dict[str, Any]:
         ("system", """
 Eres un asistente para confirmar citas. Flujo inteligente:
 
-1) Si el usuario no da fecha/hora, pide fecha. Si dice relativa, usa `resolve_relative_date` (America/Bogota) y guarda `selected_date`.
-2) Con `selected_date` (y hora si la da), usa `find_appointment_for_update(contact_id, date[, time])`.
-   - 0 resultados: informa que no encontraste citas para esa fecha y ofrece listar próximas con `get_upcoming_user_appointments(contact_id)`.
+**PASO 0 - CRÍTICO: Resolver contacto si no existe**
+- Si `contact_id` es NULO o None, DEBES PRIMERO llamar a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener el UUID del contacto.
+- NUNCA uses el número de teléfono como contact_id. El contact_id es un UUID que obtienes de `resolve_contact_on_booking`.
+- Solo después de tener el contact_id UUID válido, procede con los siguientes pasos.
+
+1) Si el usuario no da fecha/hora, pide fecha. 
+2) **CRÍTICO**: Si el usuario menciona CUALQUIER fecha relativa (hoy, mañana, pasado mañana, esta semana, próxima semana, DD/MM, DD-MM), DEBES PRIMERO usar `resolve_relative_date(date_str="<exactamente lo que dijo el usuario>", timezone="America/Bogota")` y guardar el resultado como `selected_date`.
+   - NUNCA intentes adivinar o hardcodear fechas. SIEMPRE usa `resolve_relative_date` primero.
+3) Solo DESPUÉS de tener `selected_date` resuelto (y hora si la da), usa `find_appointment_for_update(contact_id, date[, time])` usando el UUID.
+   - 0 resultados: informa que no encontraste citas para esa fecha y ofrece listar próximas con `get_upcoming_user_appointments(contact_id)` con el UUID.
    - 1 resultado: confirma explícitamente si desea confirmar esa cita y llama `confirm_appointment(appointment_id)`.
    - >1 resultado: pide la hora exacta para desambiguar.
 3) Tras confirmar, responde con un mensaje de confirmación con fecha y hora.
@@ -530,13 +549,33 @@ Responde breve y con 1 emoji sutil.
 async def reschedule_node(state: GlobalState) -> Dict[str, Any]:
     print("--- 🔁 NODO: Reagendamiento ---")
     print(f"[reschedule] contact_id actual: {state.get('contact_id')}")
+    # Debug completo del estado
+    print(f"[reschedule] 🔍 Estado completo de slots:")
+    print(f"  - available_slots en state: {state.get('available_slots') is not None}")
+    print(f"  - Cantidad de slots: {len(state.get('available_slots', []))}")
+    if state.get('available_slots'):
+        print(f"  - Primeros 2 slots: {state.get('available_slots')[:2]}")
     prompt = ChatPromptTemplate.from_messages([
         ("system", """
 Eres un asistente para reagendar citas. Sigue este orden ESTRICTO:
 
+**PASO 0 - CRÍTICO: Resolver contacto si no existe**
+- Si `contact_id` es NULO o None, DEBES PRIMERO llamar a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})` para obtener el UUID del contacto.
+- NUNCA uses el número de teléfono como contact_id. El contact_id es un UUID que obtienes de `resolve_contact_on_booking`.
+- Solo después de tener el contact_id UUID válido, procede con los siguientes pasos.
+
+**EJEMPLO DE FLUJO CORRECTO:**
+Usuario: "quiero reagendar una cita que tengo para hoy a las 4pm"
+1. Llamas: resolve_contact_on_booking(...) → obtienes contact_id UUID
+2. Llamas: resolve_relative_date(date_str="hoy", timezone="America/Bogota") → obtienes "2025-01-14"  
+3. Llamas: find_appointment_for_update(contact_id=<UUID>, date_str="2025-01-14", time_str="16:00")
+
 1) Ubicar la cita actual (obligatorio antes de pedir nueva fecha/hora):
-   - Si el usuario no recuerda, ofrece listar con `get_upcoming_user_appointments(contact_id)` y que elija.
-   - Si da fecha (y opcional hora), usa `find_appointment_for_update(contact_id, date[, time])`.
+   - IMPORTANTE: Usa el contact_id UUID (NO el número de teléfono) en todas las herramientas.
+   - **CRÍTICO**: Si el usuario menciona fechas relativas como "hoy", "mañana", "pasado mañana", "esta semana", "la próxima semana", o fechas en formato DD/MM o DD-MM, DEBES PRIMERO llamar a `resolve_relative_date(date_str="<lo que dijo el usuario>", timezone="America/Bogota")` para obtener la fecha en formato YYYY-MM-DD.
+   - NUNCA intentes adivinar o hardcodear fechas. SIEMPRE usa `resolve_relative_date` para fechas relativas.
+   - Si el usuario no recuerda la fecha, ofrece listar con `get_upcoming_user_appointments(contact_id)` donde contact_id es el UUID obtenido.
+   - Solo después de tener la fecha resuelta (YYYY-MM-DD), usa `find_appointment_for_update(contact_id, date[, time])` con el UUID.
    - Cuando haya exactamente una cita, considera la cita IDENTIFICADA.
 
 2) Pedir nueva fecha/hora:
@@ -556,8 +595,8 @@ Manejo de errores:
 
 **Resolución de contacto (multitenancy):**
 - Si `contact_id` es NULO, primero llama a `resolve_contact_on_booking(organization_id={organization_id}, phone_number={phone_number}, country_code={country_code})`.
-- Si `contact_id` YA existe, NO llames `resolve_contact_on_booking`.
-- Si falta nombre/apellido, pídelos y vuelve a llamar pasando `first_name` y `last_name`. Luego, enlaza con `link_chat_identity_to_contact(chat_identity_id={chat_identity_id}, organization_id={organization_id}, contact_id=<id>)`.
+- El resultado te dará un contact_id UUID que debes usar en todas las herramientas siguientes.
+- Si falta nombre/apellido, pídelos y vuelve a llamar pasando `first_name` y `last_name`. Luego, enlaza con `link_chat_identity_to_contact(chat_identity_id={chat_identity_id}, organization_id={organization_id}, contact_id=<uuid>)`.
 
 **Regla clave (teléfono):**
 - Nunca pidas el número de teléfono al usuario. Usa `phone_number` y `country_code` del contexto.
@@ -566,6 +605,11 @@ Manejo de errores:
 - Ejecuta `check_availability` antes de `select_appointment_slot`.
 - Al llamar `select_appointment_slot`, pasa `available_slots` EXACTAMENTE como lo devolvió `check_availability`.
 - Si `available_slots` falta o está vacío, ejecuta `check_availability` y luego `select_appointment_slot`.
+- **IMPORTANTE**: Si ya tienes `available_slots` cargados (se muestran abajo), NO vuelvas a llamar `check_availability`. Usa directamente `select_appointment_slot` con los slots existentes.
+
+**Estado actual de slots disponibles:**
+- Slots cargados: {available_slots}
+- Si los slots ya están cargados y el usuario elige una hora (ej: "2:30 PM", "14:30"), llama directamente `select_appointment_slot` con los slots existentes.
 
 **Falta de disponibilidad:**
 - Si el día no tiene horarios, dilo y pide otro día.
@@ -603,6 +647,10 @@ Manejo de errores:
                 print(f"  - {role}: {getattr(m, 'content', '')[:200]}")
         except Exception:
             pass
+    # Debug: mostrar el estado actual de los slots
+    print(f"[reschedule] Estado actual - available_slots: {len(state.get('available_slots') or [])} slots, selected_date: {state.get('selected_date')}, service_id: {state.get('service_id')}, focused_appointment: {bool(state.get('focused_appointment'))}")
+    print(f"[reschedule] Herramientas disponibles: {[t.__name__ if hasattr(t, '__name__') else str(t) for t in tools_for_res]}")
+    
     response = await runnable.ainvoke({
         "messages": state["messages"],
         "organization_id": state.get("organization_id"),
@@ -610,6 +658,9 @@ Manejo de errores:
         "phone_number": state.get("phone_number"),
         "country_code": state.get("country_code"),
         "chat_identity_id": state.get("chat_identity_id"),
+        "available_slots": state.get("available_slots"),
+        "selected_date": state.get("selected_date"),
+        "focused_appointment": state.get("focused_appointment"),
     })
     try:
         if isinstance(response, AIMessage) and getattr(response, "tool_calls", None):
@@ -684,31 +735,44 @@ async def apply_tool_effects(state: GlobalState) -> Dict[str, Any]:
     """Aplica efectos en el estado a partir del último ToolMessage si es estructurado."""
     print("--- 🔧 NODO: Aplicar efectos de herramientas ---")
     if not state["messages"]:
+        print("🔧 No hay mensajes en el estado")
         return {}
     last_msg = state["messages"][-1]
+    print(f"🔧 Tipo del último mensaje: {type(last_msg).__name__}")
     if not isinstance(last_msg, ToolMessage):
+        print("🔧 El último mensaje no es un ToolMessage")
         return {}
 
     payload = None
+    print(f"🔧 Contenido del ToolMessage (tipo): {type(last_msg.content)}")
+    print(f"🔧 Contenido del ToolMessage (primeros 200 chars): {str(last_msg.content)[:200]}")
+    
     try:
         # Intentar decodificar si es un string JSON
         if isinstance(last_msg.content, str):
             try:
                 payload = json.loads(last_msg.content)
+                print(f"🔧 Payload decodificado desde JSON string")
             except json.JSONDecodeError:
                 # Si falla, es probable que sea un string plano, lo ignoramos para efectos de estado
+                print("🔧 No se pudo decodificar JSON del string")
                 return {}
         # Si ya es dict o list, lo usamos directamente
         elif isinstance(last_msg.content, (dict, list)):
             payload = last_msg.content
+            print(f"🔧 Payload ya es dict/list")
         else:
             # Otros tipos no se procesan para efectos de estado
+            print(f"🔧 Tipo de contenido no procesable: {type(last_msg.content)}")
             return {}
-    except Exception:
+    except Exception as e:
+        print(f"🔧 Error procesando payload: {e}")
         return {}
 
     tool_name = getattr(last_msg, "name", None)
+    print(f"🔧 Nombre de la herramienta: {tool_name}")
     if not tool_name or payload is None:
+        print(f"🔧 Sin tool_name o payload es None")
         return {}
 
     updates: Dict[str, Any] = {}
@@ -741,10 +805,8 @@ async def apply_tool_effects(state: GlobalState) -> Dict[str, Any]:
         elif isinstance(payload, list):
             slots = payload
         updates["available_slots"] = slots
-        try:
-            print(f"📦 available_slots actualizados: {len(slots)}")
-        except Exception:
-            pass
+        print(f"📦 available_slots actualizados: {len(slots)} slots")
+        print(f"📦 Ejemplo de slots: {slots[:2] if slots else 'Sin slots'}")  # Mostrar primeros 2 slots como debug
     elif tool_name == "find_appointment_for_update" and isinstance(payload, dict):
         # Guardar cita enfocada y service_id para habilitar el resto del flujo
         if payload.get("success") and (payload.get("appointment_id") or payload.get("candidates")):
@@ -795,6 +857,12 @@ async def tool_executor_node(state: GlobalState) -> Dict[str, Any]:
     final_updates = {}
     final_updates.update(tool_result) # {"messages": [ToolMessage(...)]}
     final_updates.update(state_after_effects) # {"available_slots": [...]}
+    
+    # Debug: mostrar qué actualizaciones se están aplicando
+    if state_after_effects:
+        print(f"⚙️ Actualizaciones de estado aplicadas: {list(state_after_effects.keys())}")
+        if "available_slots" in state_after_effects:
+            print(f"⚙️ available_slots tiene {len(state_after_effects['available_slots'])} elementos")
     
     return final_updates
 
