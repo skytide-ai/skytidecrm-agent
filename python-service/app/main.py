@@ -3,12 +3,14 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from langgraph.prebuilt import ToolNode
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from typing import Optional, Dict, Any, Literal, List
 import json
 import asyncio
+import time
 
 # 1. Importaciones de la nueva arquitectura
 from .state import GlobalState
@@ -225,7 +227,7 @@ knowledge_agent_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            """Eres un asistente de IA conversacional para SiluetSPA. Tu misión es responder preguntas sobre los servicios y también dudas generales de la empresa (horarios, ubicación, medios de pago, políticas, etc.).
+            """Eres un asistente de IA conversacional para SiluetSPA. Tu misión es responder preguntas sobre los servicios y también dudas generales de la empresa (horarios, ubicación, etc.).
 **Instrucciones Clave:**
 1.  **Analiza la conversación en `messages`.** El último mensaje es la pregunta más reciente del usuario.
  2.  **Si el último mensaje es una pregunta sobre servicios o dudas generales de la empresa**, usa la herramienta `knowledge_search` (con `organization_id` y, si no hay servicio específico, `service_id = null`) para obtener información precisa.
@@ -404,8 +406,12 @@ Después de que `book_appointment` retorne `success: true`:
 1. Primero confirma la cita con los detalles (fecha, hora, servicio).
 2. **CRÍTICO**: Revisa el campo `opt_in_status` en la respuesta de `book_appointment`:
    - **SOLO si es "not_set"** (no tiene ninguna configuración): pregunta "¿Te gustaría recibir recordatorios y notificaciones sobre tu cita por WhatsApp? 📱"
-   - **Si es "opt_in"**: ya tiene notificaciones activadas, NO preguntes
-   - **Si es "opt_out"**: ya rechazó notificaciones anteriormente, NO preguntes
+   - **Si es "opt_in"**: ya tiene notificaciones activadas, NO preguntes sobre notificaciones
+   - **Si es "opt_out"**: ya rechazó notificaciones anteriormente, NO preguntes sobre notificaciones
+3. **MUY IMPORTANTE - Cierre genérico**: 
+   - Si `opt_in_status` es "opt_in" o "opt_out": termina SOLO con "¿Hay algo más en lo que pueda ayudarte?"
+   - **NUNCA** sugieras acciones específicas como confirmar nombres, cambiar datos, revisar detalles, etc.
+   - **NUNCA** ofrezcas servicios adicionales ni hagas sugerencias proactivas
 
 **FASE RESPUESTA OPT-IN (MUY IMPORTANTE):**
 Si tu último mensaje preguntó sobre recordatorios/notificaciones WhatsApp y el usuario responde:
@@ -1039,30 +1045,48 @@ workflow.add_edge("tools", "supervisor")
 # La app FastAPI y estados de runtime
 app = FastAPI()
 
-class MessageSerializer:
-    def dumps(self, obj):
-        return json.dumps(dumps(obj), ensure_ascii=False)
-
-    def loads(self, s):
-        return loads(json.loads(s))
-
 @app.on_event("startup")
 async def on_startup():
-    # Usar siempre MemorySaver como checkpointer
-    app.state.checkpointer = MemorySaver()
-    print("🧠 Checkpointer en memoria (MemorySaver)")
+    # Intentar configurar Redis como checkpointer
+    REDIS_URL = os.getenv("REDIS_URL", "")
+    
+    if REDIS_URL:
+        try:
+            # AsyncRedisSaver.from_conn_string retorna un async context manager
+            # NOTA: AsyncRedisSaver NO acepta el parámetro 'serde' directamente
+            # La serialización se maneja internamente
+            app.state._redis_cm = AsyncRedisSaver.from_conn_string(REDIS_URL)
+            app.state.checkpointer = await app.state._redis_cm.__aenter__()
+            
+            # Según la documentación oficial, DEBEMOS llamar asetup() para inicializar índices
+            await app.state.checkpointer.asetup()
+            
+            print("🚀 Checkpointer Redis configurado correctamente")
+            print(f"📡 Conectado a: {REDIS_URL.split('@')[1] if '@' in REDIS_URL else 'Redis'}")
+        except Exception as e:
+            print(f"⚠️ Error configurando Redis: {e}")
+            print("🧠 Fallback a checkpointer en memoria (MemorySaver)")
+            app.state.checkpointer = MemorySaver()
+            app.state._redis_cm = None
+    else:
+        # Si no hay Redis URL, usar MemorySaver
+        print("ℹ️ REDIS_URL no configurada")
+        print("🧠 Usando checkpointer en memoria (MemorySaver)")
+        app.state.checkpointer = MemorySaver()
+        app.state._redis_cm = None
+    
     # Compilar el grafo con el checkpointer elegido
     app.state.app_graph = workflow.compile(checkpointer=app.state.checkpointer)
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    # Cerrar el context manager si existe
-    _cm = getattr(app.state, "_cp_cm", None)
-    if _cm is not None:
+    # Cerrar el context manager de Redis si existe
+    if hasattr(app.state, '_redis_cm') and app.state._redis_cm:
         try:
-            await _cm.__aexit__(None, None, None)
-        except Exception:
-            pass
+            await app.state._redis_cm.__aexit__(None, None, None)
+            print("🔌 Conexión Redis cerrada correctamente")
+        except Exception as e:
+            print(f"⚠️ Error cerrando Redis: {e}")
 
 class InvokePayload(BaseModel):
     organizationId: str
@@ -1118,43 +1142,79 @@ async def invoke(payload: InvokePayload, request: Request):
                 last_name = contact_data.get("last_name", "")
 
         context_block = await sb_get_context_block(session_id)
-        # Preferir historial reciente enviado por el gateway (Redis) si existe; fallback a Supabase
-        recent_msgs = payload.recentMessages or []
-        if recent_msgs:
-            print(f"🗂️ Usando historial desde gateway (Redis): {len(recent_msgs)} mensajes")
-            sb_history = recent_msgs[-6:]
-        else:
-            sb_history = await sb_get_last_messages(session_id, last_n=6)
         
-        # Normalizador robusto usando deserialización oficial de LangChain
-        from langchain_core.messages import HumanMessage, AIMessage
-        from langchain_core.load import loads
-        def normalize_to_message(m: Dict[str, Any]):
-            # Caso 1: formato esperado { role, content }
-            if isinstance(m, dict) and 'role' in m and 'content' in m:
-                return AIMessage(content=m['content']) if m['role'] == 'assistant' else HumanMessage(content=m['content'])
-            # Caso 2: dict serializado de LangChain ({ lc, type, id, kwargs: { content, type } })
-            if isinstance(m, dict) and 'lc' in m and 'kwargs' in m:
-                try:
-                    # Usar deserialización oficial de LangChain
-                    return loads(m)
-                except Exception as e:
-                    print(f"⚠️ Error deserializando mensaje LangChain: {e}")
-                    # Fallback manual
-                    content = m['kwargs'].get('content', '')
-                    msg_type = m['kwargs'].get('type', 'human')
-                    return AIMessage(content=content) if msg_type == 'ai' else HumanMessage(content=content)
-            # Fallback: tratar como humano
-            return HumanMessage(content=str(m))
-
-        conversation_history = [normalize_to_message(m) for m in sb_history]
-        # Evitar duplicar el último mensaje humano si ya viene en el historial
-        if not (
-            conversation_history
-            and isinstance(conversation_history[-1], HumanMessage)
-            and conversation_history[-1].content == payload.message
-        ):
+        # Importar las clases de mensajes al inicio (se necesitan en ambos casos)
+        from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+        from typing import Any
+        
+        # Verificar si Redis ya tiene estado para este thread
+        has_redis_state = False
+        if app.state.checkpointer:
+            try:
+                # Intentar obtener el estado del checkpointer
+                config_check = {"configurable": {"thread_id": session_id}}
+                existing_state = await app.state.checkpointer.aget(config_check)
+                has_redis_state = existing_state is not None and existing_state.get("channel_values")
+                if has_redis_state:
+                    print(f"♨️ Redis tiene estado existente para thread {session_id}")
+            except Exception as e:
+                print(f"⚠️ Error verificando estado en Redis: {e}")
+                has_redis_state = False
+        
+        # Si Redis tiene estado, NO cargar mensajes de Supabase (evitar duplicación)
+        if has_redis_state:
+            print(f"📦 Usando estado completo desde Redis (no se cargan mensajes de Supabase)")
+            conversation_history = []
+            # Solo agregar el mensaje actual del usuario
             conversation_history.append(HumanMessage(content=payload.message))
+        else:
+            # Arranque en frío: cargar contexto desde Supabase
+            print(f"❄️ Arranque en frío detectado, cargando contexto desde Supabase")
+            
+            # Preferir historial reciente enviado por el gateway (Redis) si existe; fallback a Supabase
+            recent_msgs = payload.recentMessages or []
+            if recent_msgs:
+                print(f"🗂️ Usando historial desde gateway (Redis): {len(recent_msgs)} mensajes")
+                sb_history = recent_msgs[-6:]
+            else:
+                sb_history = await sb_get_last_messages(session_id, last_n=6)
+            
+            def normalize_to_message(m: Any):
+                # Si ya es un BaseMessage, retornarlo directamente
+                if isinstance(m, BaseMessage):
+                    return m
+                
+                # Si es un dict con role y content (formato simple)
+                if isinstance(m, dict) and 'role' in m and 'content' in m:
+                    content = str(m.get('content', ''))
+                    if m['role'] == 'assistant' or m['role'] == 'ai':
+                        return AIMessage(content=content)
+                    else:
+                        return HumanMessage(content=content)
+                
+                # Si es cualquier otro dict, intentar extraer content
+                if isinstance(m, dict):
+                    content = str(m.get('content', str(m)))
+                    return HumanMessage(content=content)
+                
+                # Fallback: convertir a string
+                return HumanMessage(content=str(m))
+
+            conversation_history = [normalize_to_message(m) for m in sb_history]
+            
+            # Filtrar mensajes inválidos y asegurar que todos tengan content
+            conversation_history = [
+                msg for msg in conversation_history 
+                if msg and hasattr(msg, 'content') and msg.content is not None
+            ]
+            
+            # Evitar duplicar el último mensaje humano si ya viene en el historial
+            if not (
+                conversation_history
+                and isinstance(conversation_history[-1], HumanMessage)
+                and conversation_history[-1].content == payload.message
+            ):
+                conversation_history.append(HumanMessage(content=payload.message))
         
         # Debug: verificar que todos los mensajes son objetos Message válidos
         if os.getenv("LOG_VERBOSE", "false").lower() in ("1", "true", "yes"):
@@ -1169,7 +1229,6 @@ async def invoke(payload: InvokePayload, request: Request):
             "tags": [f"org:{payload.organizationId}", f"chat:{session_id}"]
         }
 
-        # Eliminada validación/limpieza de estado Redis; con MemorySaver no aplica
         # Construir estado inicial sin sobreescribir `contact_id` si viene nulo
         initial_state_data: Dict[str, Any] = {
             "messages": conversation_history,
@@ -1182,12 +1241,43 @@ async def invoke(payload: InvokePayload, request: Request):
         }
         if payload.contactId:
             initial_state_data["contact_id"] = payload.contactId
-        initial_state = GlobalState(**initial_state_data)
+        
+        # No usar GlobalState(**initial_state_data) porque puede causar problemas de serialización
+        # En su lugar, pasar el dict directamente a ainvoke
         
         # Ejecución asíncrona con checkpointer
-        final_state_result = await app.state.app_graph.ainvoke(
-            initial_state, {**config, "recursion_limit": 50}
-        )
+        try:
+            final_state_result = await app.state.app_graph.ainvoke(
+                initial_state_data, {**config, "recursion_limit": 50}
+            )
+        except (ValueError, KeyError) as e:
+            error_msg = str(e)
+            # Si hay un error de formato de mensaje o serialización
+            if any(err in error_msg for err in [
+                "Message dict must contain 'role' and 'content' keys",
+                "MESSAGE_COERCION_FAILURE",
+                "'content'",
+                "kwargs"
+            ]):
+                print(f"⚠️ Estado corrupto detectado para thread {session_id}")
+                print(f"   Error: {error_msg[:200]}")
+                print(f"🔄 Iniciando nueva conversación limpia...")
+                
+                # Crear un nuevo thread_id único para evitar el estado corrupto
+                new_session_id = f"{session_id}_clean_{int(time.time())}"
+                config["configurable"]["thread_id"] = new_session_id
+                
+                print(f"   Nuevo thread_id: {new_session_id}")
+                
+                # Reintentar con el nuevo thread_id limpio
+                final_state_result = await app.state.app_graph.ainvoke(
+                    initial_state_data, {**config, "recursion_limit": 50}
+                )
+                
+                print(f"✅ Conversación iniciada correctamente con thread limpio")
+            else:
+                # Re-lanzar otros errores
+                raise
 
         ai_response_content = "No pude procesar tu solicitud."
         if final_state_result and final_state_result.get("messages"):

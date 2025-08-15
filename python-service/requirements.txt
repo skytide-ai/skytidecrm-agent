@@ -1,6 +1,8 @@
 fastapi
 uvicorn
 langgraph
+langgraph-checkpoint-redis
+redis
 python-dotenv
 openai
 langchain-openai
