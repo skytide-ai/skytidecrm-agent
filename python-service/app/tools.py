@@ -184,9 +184,41 @@ async def knowledge_search(organization_id: str, query: str, service_id: Optiona
         return [{"success": False, "message": "No encontré servicios específicos para esa consulta."}]
 
 @tool
-def update_service_in_state(service_id: str, service_name: str) -> Dict[str, Any]:
-    """Confirma el servicio seleccionado. Devuelve una carga útil estructurada para actualizar el estado."""
+async def update_service_in_state(service_id: str, service_name: str, organization_id: str) -> Dict[str, Any]:
+    """Confirma el servicio seleccionado. Verifica si requiere valoración previa."""
     print(f"--- 🛠️ Herramienta: update_service_in_state ---")
+    print(f"Verificando service_id: {service_id}, service_name: {service_name}")
+    
+    # Verificar si el servicio requiere valoración previa
+    try:
+        # Buscar en knowledge_base los metadatos del servicio
+        response = await run_db(lambda: supabase_client
+                               .table('knowledge_base')
+                               .select('metadata')
+                               .eq('metadata->>organization_id', organization_id)
+                               .eq('metadata->>service_id', service_id)
+                               .limit(1)
+                               .execute())
+        
+        if response.data and len(response.data) > 0:
+            metadata = response.data[0].get('metadata', {})
+            requires_assessment = metadata.get('requires_assessment', False)
+            
+            print(f"📋 Servicio {service_name} - requires_assessment: {requires_assessment}")
+            
+            if requires_assessment:
+                return {
+                    "success": True,
+                    "action": "requires_assessment",
+                    "original_service_id": service_id,
+                    "original_service_name": service_name,
+                    "message": f"El servicio {service_name} requiere una valoración previa para poder agendarse."
+                }
+    except Exception as e:
+        print(f"⚠️ Error verificando requirements: {e}")
+        # En caso de error, continuar con el flujo normal
+    
+    # Flujo normal - no requiere valoración o hubo error
     print(f"✅ Guardando service_id: {service_id}, service_name: {service_name}")
     return {
         "success": True,

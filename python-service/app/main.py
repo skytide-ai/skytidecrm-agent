@@ -130,7 +130,11 @@ async def supervisor_node(state: GlobalState) -> Dict[str, Any]:
     if isinstance(state["messages"][-1], ToolMessage):
         print(f"🚦 Devolviendo control a '{state['current_flow']}' tras ejecución de herramienta.")
         # Debug: verificar si los slots están en el estado después de tools
-        print(f"🚦 Estado de slots en supervisor: {len(state.get('available_slots', []))} slots disponibles")
+        available_slots = state.get('available_slots')
+        if available_slots is not None:
+            print(f"🚦 Estado de slots en supervisor: {len(available_slots)} slots disponibles")
+        else:
+            print(f"🚦 Estado de slots en supervisor: No hay slots en el estado")
         return {"next_agent": state['current_flow']}
 
     last_message = state["messages"][-1].content
@@ -212,18 +216,15 @@ Al invocar herramientas, usa estos valores exactamente para los parámetros corr
 - Mantén un tono empático.
 
 **Reglas de veracidad (obligatorias):**
-- No inventes información ni detalles que no estén en las fuentes o en el contexto.
-- No afirmes que realizaste acciones (reservas, confirmaciones, cambios) si no han ocurrido; en este nodo jamás se realizan acciones, solo se informa.
-- Si no estás seguro, pide aclarar o ofrece escalar con un asesor.
-- **NUNCA ofrezcas proporcionar información específica que no tienes** (como números de contacto, direcciones exactas, instrucciones de llegada, etc.) a menos que esa información esté explícitamente disponible en los resultados de `knowledge_search`.
-- Si el usuario solicita información que no está en tus resultados, di claramente que no tienes esa información específica disponible y ofrece hablar con un asesor.
+- **Solo proporciona información que esté explícitamente en los resultados de `knowledge_search`**. No inventes ni supongas datos.
+- **No ofrezcas proporcionar información o servicios que no puedas cumplir**. Si no tienes un dato, di que no está disponible.
+- **Limítate a responder lo preguntado** sin añadir ofertas o sugerencias no solicitadas.
+- No afirmes acciones que no realizaste. Este nodo solo informa, no ejecuta acciones.
 
-**Regla de relevancia, errores y escalamiento:**
-- Después de usar `knowledge_search`, responde únicamente si la información encontrada responde directamente a la pregunta del usuario (relevancia alta y explícita).
-- Si hay un error técnico al usar una herramienta o no puedes completar la acción, informa brevemente el problema y pregunta "¿Te gustaría hablar con un asesor?".
-- Si los resultados no responden claramente (o son tangenciales), indica que no encontraste información relevante sobre esa pregunta, ofrece reformular o preguntar "¿Te gustaría hablar con un asesor?".
-- Solo llama `escalate_to_human` DESPUÉS de que el usuario confirme explícitamente que quiere hablar con un asesor.
-- **No ofrezcas ayuda para cosas que no puedes hacer**. Por ejemplo, no digas "puedo ayudarte con X" si no tienes la información o capacidad para hacerlo.
+**Regla de relevancia y escalamiento:**
+- Responde únicamente con información encontrada en `knowledge_search`.
+- Si no tienes la información solicitada o hay un error, pregunta: "¿Te gustaría hablar con un asesor?".
+- Solo llama `escalate_to_human` DESPUÉS de confirmación explícita del usuario.
 """
         ),
         MessagesPlaceholder(variable_name="messages"),
@@ -287,18 +288,27 @@ appointment_agent_prompt = ChatPromptTemplate.from_messages(
             "system",
             """Eres un agente experto en agendar citas. Tu objetivo es guiar al usuario a través del proceso de reserva.
 
-**FASE ACTUAL (revisa `service_id` para saber en qué fase estás):**
-- **FASE 1: Identificación (si `service_id` es NULO)**
+**FASE ACTUAL (revisa `service_id` y `pending_assessment_service` para saber en qué fase estás):**
+
+- **FASE ESPECIAL: Servicio requiere valoración (si `pending_assessment_service` NO es NULO)**
+  1. Informa al usuario que el servicio mencionado requiere una valoración previa (usa el nombre del servicio que está en `pending_assessment_service`).
+  2. Pregunta: "¿Te gustaría agendar primero una cita de valoración?"
+  3. Si acepta: usa `knowledge_search` con "valoración" o "consulta de valoración" para buscar el servicio de valoración.
+  4. Una vez encontrado, usa `update_service_in_state` (con organization_id={organization_id}) con el service_id de la valoración. Después de guardar el servicio, procede inmediatamente a preguntar "¿Para qué fecha te gustaría agendar la valoración?" y continúa con el flujo de FASE 2.
+  5. Si rechaza: di "Entiendo. Para agendar [servicio original] necesitarás primero una valoración. ¿Hay algo más en lo que pueda ayudarte?"
+
+- **FASE 1: Identificación (si `service_id` es NULO y `pending_assessment_service` es NULO)**
   1. Si el último mensaje del usuario SOLO expresa intención genérica (p. ej., "quiero agendar"), primero PREGUNTA de forma clara: "¿Qué servicio te gustaría agendar?". NO uses herramientas todavía. No sugieras ejemplos ni inventes nombres de servicios.
   2. Solo si el ÚLTIMO mensaje contiene un nombre explícito de un servicio, usa `knowledge_search` para identificarlo y luego PIDE confirmación. No propongas nombres de servicios por tu cuenta.
-  3. Tras confirmación explícita del usuario, usa `update_service_in_state` para guardar el servicio.
+  3. Tras confirmación explícita del usuario, usa `update_service_in_state` (con organization_id={organization_id}) para guardar el servicio.
 
-- **FASE 2: Reserva (si `service_id` YA EXISTE)**
+- **FASE 2: Reserva (si `service_id` YA EXISTE y `pending_assessment_service` es NULO)**
   1. Tu misión es completar la reserva. NO busques servicios.
-  2. Sigue estrictamente: Preguntar fecha -> `check_availability` (con `service_id`, `organization_id`, `check_date_str`) -> si hay slots, pedir hora y usar `select_appointment_slot` -> finalmente `book_appointment`.
-  3. Nunca digas "no hay horarios" sin haber llamado antes a `check_availability` y sin haber verificado que la lista retornada esté vacía.
-  4. Si el usuario expresa fechas relativas ("hoy", "mañana", "la otra semana", formatos DD/MM o DD-MM), primero usa `resolve_relative_date` con `timezone="America/Bogota"` para obtener `selected_date` en formato YYYY-MM-DD y luego llama a `check_availability`.
-  5. **IMPORTANTE**: Al llamar `select_appointment_slot` DEBES pasar TRES parámetros obligatorios:
+  2. IMPORTANTE: Si acabas de establecer el servicio con `update_service_in_state`, DEBES preguntar inmediatamente "¿Para qué fecha te gustaría agendar?" sin esperar otra interacción.
+  3. Sigue estrictamente: Preguntar fecha -> `check_availability` (con `service_id`, `organization_id`, `check_date_str`) -> si hay slots, pedir hora y usar `select_appointment_slot` -> finalmente `book_appointment`.
+  4. Nunca digas "no hay horarios" sin haber llamado antes a `check_availability` y sin haber verificado que la lista retornada esté vacía.
+  5. Si el usuario expresa fechas relativas ("hoy", "mañana", "la otra semana", formatos DD/MM o DD-MM), primero usa `resolve_relative_date` con `timezone="America/Bogota"` para obtener `selected_date` en formato YYYY-MM-DD y luego llama a `check_availability`.
+  6. **IMPORTANTE**: Al llamar `select_appointment_slot` DEBES pasar TRES parámetros obligatorios:
      - `appointment_date`: la fecha en formato YYYY-MM-DD
      - `start_time`: la hora de inicio en formato HH:MM
      - `available_slots`: DEBES pasar la lista completa de slots exactamente como la tienes en el estado (ver "Slots disponibles cargados" abajo)
@@ -315,9 +325,10 @@ appointment_agent_prompt = ChatPromptTemplate.from_messages(
 
 **Estado Actual:**
 - Servicio: {service_name} (ID: {service_id})
+- Servicio pendiente de valoración: {pending_assessment_service}
 - Fecha: {selected_date}
 - Hora: {selected_time}
- - Slots disponibles cargados: {available_slots}
+- Slots disponibles cargados: {available_slots}
 **Contexto:** {context_block}
 
 **Variables para herramientas (multitenancy):**
@@ -376,6 +387,7 @@ async def appointment_node(state: GlobalState) -> Dict[str, Any]:
             "selected_date": state.get("selected_date"),
             "selected_time": state.get("selected_time"),
             "available_slots": state.get("available_slots"),
+            "pending_assessment_service": state.get("pending_assessment_service"),
             "context_block": state.get("context_block", "No hay resumen."),
             "messages": state["messages"],
             "organization_id": state.get("organization_id"),
@@ -810,7 +822,21 @@ async def apply_tool_effects(state: GlobalState) -> Dict[str, Any]:
 
     # Manejo específico por herramienta
     if tool_name == "update_service_in_state" and isinstance(payload, dict):
-        if payload.get("action") == "update_service":
+        if payload.get("action") == "requires_assessment":
+            # El servicio requiere valoración previa
+            updates["pending_assessment_service"] = {
+                "service_id": payload.get("original_service_id"),
+                "service_name": payload.get("original_service_name"),
+                "message": payload.get("message")
+            }
+            # Limpiar el contexto para evitar confusión
+            updates["service_id"] = None
+            updates["service_name"] = None
+            updates["available_slots"] = None
+            updates["selected_date"] = None
+            updates["selected_time"] = None
+            updates["selected_member_id"] = None
+        elif payload.get("action") == "update_service":
             updates["service_id"] = payload.get("service_id")
             updates["service_name"] = payload.get("service_name")
             # Al cambiar servicio, limpiar contexto volátil
@@ -819,6 +845,8 @@ async def apply_tool_effects(state: GlobalState) -> Dict[str, Any]:
             updates["selected_time"] = None
             updates["selected_member_id"] = None
             updates["ready_to_book"] = None
+            # Si había un pending_assessment_service, limpiarlo
+            updates["pending_assessment_service"] = None
     elif tool_name == "resolve_relative_date" and isinstance(payload, dict):
         if payload.get("selected_date"):
             updates["selected_date"] = payload.get("selected_date")
@@ -892,7 +920,7 @@ async def tool_executor_node(state: GlobalState) -> Dict[str, Any]:
     # Debug: mostrar qué actualizaciones se están aplicando
     if state_after_effects:
         print(f"⚙️ Actualizaciones de estado aplicadas: {list(state_after_effects.keys())}")
-        if "available_slots" in state_after_effects:
+        if "available_slots" in state_after_effects and state_after_effects["available_slots"] is not None:
             print(f"⚙️ available_slots tiene {len(state_after_effects['available_slots'])} elementos")
     
     return final_updates

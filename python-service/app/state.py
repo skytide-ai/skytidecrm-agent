@@ -39,3 +39,6 @@ class GlobalState(TypedDict):
     # --- CAMPO PARA EL ENRUTADOR PRINCIPAL ---
     current_flow: Optional[str] = None
     context_block: Optional[str] = None
+    
+    # --- CAMPO PARA SERVICIOS QUE REQUIEREN VALORACIÓN ---
+    pending_assessment_service: Optional[Dict[str, Any]] = None
