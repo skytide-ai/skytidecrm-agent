@@ -42,3 +42,6 @@ class GlobalState(TypedDict):
     
     # --- CAMPO PARA SERVICIOS QUE REQUIEREN VALORACIÓN ---
     pending_assessment_service: Optional[Dict[str, Any]] = None
+    
+    # --- CAMPO PARA RASTREAR SI ESTAMOS ESPERANDO RESPUESTA DE OPT-IN ---
+    waiting_opt_in_response: Optional[bool] = None

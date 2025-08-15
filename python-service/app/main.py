@@ -149,6 +149,45 @@ async def supervisor_node(state: GlobalState) -> Dict[str, Any]:
     try:
         current_flow = state.get("current_flow")
         msg_lc = (last_message or "").lower()
+        
+        # Mantener el flujo de appointment cuando estamos en proceso de agendamiento
+        if current_flow == "appointment":
+            # Buscar el último mensaje del asistente
+            last_ai_msg = None
+            for msg in reversed(state["messages"][:-1]):  # Excluir el último mensaje del usuario
+                if isinstance(msg, AIMessage):
+                    last_ai_msg = msg.content.lower() if msg.content else ""
+                    break
+            
+            # Si el último mensaje del asistente pregunta sobre notificaciones/recordatorios WhatsApp
+            if last_ai_msg and any(phrase in last_ai_msg for phrase in ["recordatorios por whatsapp", "notificaciones sobre tu cita", "notificaciones por whatsapp", "whatsapp para esta cita"]):
+                # Y el usuario responde afirmativamente
+                if msg_lc in ["sí", "si", "claro", "ok", "dale", "por favor", "quiero", "acepto", "de acuerdo", "perfecto"]:
+                    # Mantener en appointment para procesar el opt-in
+                    preferred_next = "appointment"
+            
+            # Si tenemos un servicio seleccionado y el usuario confirma una hora/fecha
+            # NO desviar a confirmation (que es para citas existentes)
+            if state.get("service_id") and route.next == "confirmation":
+                # Si no hay una cita ya agendada (no hay appointment_id en los últimos mensajes)
+                # entonces estamos en proceso de AGENDAR, no de CONFIRMAR
+                has_booked_appointment = False
+                for msg in reversed(state["messages"][-10:]):
+                    if isinstance(msg, ToolMessage) and hasattr(msg, 'name') and msg.name == "book_appointment":
+                        content = msg.content if isinstance(msg.content, dict) else {}
+                        if isinstance(msg.content, str):
+                            try:
+                                content = json.loads(msg.content)
+                            except:
+                                pass
+                        if content.get("success"):
+                            has_booked_appointment = True
+                            break
+                
+                if not has_booked_appointment:
+                    # Estamos agendando, no confirmando
+                    preferred_next = "appointment"
+        
         if current_flow in ("confirmation", "cancellation", "reschedule"):
             phrases_uncertain = [
                 "no recuerdo", "no me acuerdo", "no sé la fecha", "no se la fecha",
@@ -319,8 +358,9 @@ appointment_agent_prompt = ChatPromptTemplate.from_messages(
      Si `available_slots` está vacío o no existe, primero vuelve a ejecutar `check_availability` y recién después llama a `select_appointment_slot`.
 
 **Manejo de disponibilidad (sugerencias):**
-- Si el día no tiene disponibilidad, informa claramente que ese día no hay horarios y pide al usuario elegir otra fecha.
-- Si la hora pedida no está en `available_slots`, sugiere 3–5 horarios cercanos del mismo día usando `available_slots` y pide elegir uno de ellos.
+- **CRÍTICO**: Si `check_availability` devuelve una lista vacía ([]) o `available_slots` tiene 0 elementos, significa que NO hay disponibilidad ese día. NO digas que hubo un problema. Di claramente: "Lo siento, no hay horarios disponibles para el [fecha]. ¿Te gustaría intentar con otra fecha?"
+- Si el día tiene disponibilidad pero la hora pedida no está en `available_slots`, sugiere 3–5 horarios cercanos del mismo día usando `available_slots` y pide elegir uno de ellos.
+- NUNCA digas que hubo un "problema" cuando simplemente no hay disponibilidad.
 
 **Cambio de servicio (cuando ya hay `service_id`):**
 - Si el usuario menciona explícitamente otro servicio distinto al actual (por nombre o sinónimos) o rechaza el actual, primero CONFIRMA: "¿Deseas cambiar al servicio ‘X’?".
@@ -364,10 +404,17 @@ Después de que `book_appointment` retorne `success: true`:
 1. Primero confirma la cita con los detalles (fecha, hora, servicio).
 2. **CRÍTICO**: Revisa el campo `opt_in_status` en la respuesta de `book_appointment`:
    - **SOLO si es "not_set"** (no tiene ninguna configuración): pregunta "¿Te gustaría recibir recordatorios y notificaciones sobre tu cita por WhatsApp? 📱"
-     * Si acepta: llama `create_whatsapp_opt_in(organization_id={organization_id}, contact_id={contact_id}, member_id={selected_member_id})`
-     * Si rechaza: respeta su decisión y no insistas
    - **Si es "opt_in"**: ya tiene notificaciones activadas, NO preguntes
    - **Si es "opt_out"**: ya rechazó notificaciones anteriormente, NO preguntes
+
+**FASE RESPUESTA OPT-IN (MUY IMPORTANTE):**
+Si tu último mensaje preguntó sobre recordatorios/notificaciones WhatsApp y el usuario responde:
+- **Respuestas afirmativas** ("sí", "si", "claro", "ok", "dale", "por favor", "quiero", "acepto"): 
+  * Llama `create_whatsapp_opt_in(organization_id={organization_id}, contact_id={contact_id}, member_id={selected_member_id})`
+  * Confirma: "✅ Perfecto, recibirás recordatorios por WhatsApp"
+- **Respuestas negativas** ("no", "no quiero", "no gracias", "paso"):
+  * NO llames create_whatsapp_opt_in
+  * Responde: "Entendido, no te enviaremos recordatorios por WhatsApp"
 
 **Reglas de veracidad (obligatorias):**
 - No inventes horarios ni estados de reserva.
@@ -657,8 +704,9 @@ Manejo de errores:
 - Si los slots ya están cargados y el usuario elige una hora (ej: "2:30 PM", "14:30"), llama directamente `select_appointment_slot` con los slots existentes.
 
 **Falta de disponibilidad:**
-- Si el día no tiene horarios, dilo y pide otro día.
-- Si la hora pedida no está, sugiere 3–5 horarios cercanos del mismo día.
+- **CRÍTICO**: Si `check_availability` devuelve una lista vacía ([]) o `available_slots` tiene 0 elementos, significa que NO hay disponibilidad ese día. NO digas que hubo un problema. Di claramente: "No hay horarios disponibles para el [fecha]. ¿Qué otra fecha te gustaría intentar?"
+- Si el día tiene disponibilidad pero la hora pedida no está, sugiere 3–5 horarios cercanos del mismo día.
+- NUNCA digas que hubo un "problema" cuando simplemente no hay disponibilidad.
 
 **REGLA DE VERACIDAD (MUY IMPORTANTE):**
 - **NUNCA** confirmes un reagendamiento si la herramienta `reschedule_appointment` no ha sido llamada y ha devuelto `success: True`.
