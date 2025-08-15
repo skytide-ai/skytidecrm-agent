@@ -269,6 +269,7 @@ from .tools import (
     confirm_appointment,
     reschedule_appointment,
     link_chat_identity_to_contact,
+    create_whatsapp_opt_in,
 )
 appointment_tools = [
     knowledge_search,
@@ -279,6 +280,7 @@ appointment_tools = [
     book_appointment,
     resolve_contact_on_booking,
     link_chat_identity_to_contact,
+    create_whatsapp_opt_in,
     get_user_appointments,
     cancel_appointment,
 ]
@@ -303,12 +305,14 @@ appointment_agent_prompt = ChatPromptTemplate.from_messages(
   3. Tras confirmación explícita del usuario, usa `update_service_in_state` (con organization_id={organization_id}) para guardar el servicio.
 
 - **FASE 2: Reserva (si `service_id` YA EXISTE y `pending_assessment_service` es NULO)**
-  1. Tu misión es completar la reserva. NO busques servicios.
-  2. IMPORTANTE: Si acabas de establecer el servicio con `update_service_in_state`, DEBES preguntar inmediatamente "¿Para qué fecha te gustaría agendar?" sin esperar otra interacción.
-  3. Sigue estrictamente: Preguntar fecha -> `check_availability` (con `service_id`, `organization_id`, `check_date_str`) -> si hay slots, pedir hora y usar `select_appointment_slot` -> finalmente `book_appointment`.
-  4. Nunca digas "no hay horarios" sin haber llamado antes a `check_availability` y sin haber verificado que la lista retornada esté vacía.
-  5. Si el usuario expresa fechas relativas ("hoy", "mañana", "la otra semana", formatos DD/MM o DD-MM), primero usa `resolve_relative_date` con `timezone="America/Bogota"` para obtener `selected_date` en formato YYYY-MM-DD y luego llama a `check_availability`.
-  6. **IMPORTANTE**: Al llamar `select_appointment_slot` DEBES pasar TRES parámetros obligatorios:
+  1. Tu misión es completar la reserva. **NUNCA preguntes qué servicio** - ya lo tienes.
+  2. Evalúa el estado actual y actúa según lo que falta:
+     - Si NO tienes `selected_date`: pregunta "¿Para qué fecha te gustaría agendar?"
+     - Si tienes `selected_date` pero NO tienes `available_slots`: ejecuta `check_availability`
+     - Si tienes `available_slots` pero NO tienes `selected_time`: muestra horarios y pide elegir
+     - Si tienes todo: procede con `book_appointment`
+  3. Para fechas relativas usa `resolve_relative_date` con `timezone="America/Bogota"`
+  4. **IMPORTANTE**: Al llamar `select_appointment_slot` DEBES pasar TRES parámetros obligatorios:
      - `appointment_date`: la fecha en formato YYYY-MM-DD
      - `start_time`: la hora de inicio en formato HH:MM
      - `available_slots`: DEBES pasar la lista completa de slots exactamente como la tienes en el estado (ver "Slots disponibles cargados" abajo)
@@ -328,6 +332,7 @@ appointment_agent_prompt = ChatPromptTemplate.from_messages(
 - Servicio pendiente de valoración: {pending_assessment_service}
 - Fecha: {selected_date}
 - Hora: {selected_time}
+- Miembro seleccionado: {selected_member_id}
 - Slots disponibles cargados: {available_slots}
 **Contexto:** {context_block}
 
@@ -338,13 +343,15 @@ appointment_agent_prompt = ChatPromptTemplate.from_messages(
 - phone_number: {phone_number}
 - country_code: {country_code}
 - chat_identity_id: {chat_identity_id}
+- selected_member_id: {selected_member_id}
 
 Al invocar herramientas, usa estos valores exactamente para los parámetros correspondientes.
 
 Si `contact_id` es nulo y necesitas agendar, primero llama a `resolve_contact_on_booking` con `organization_id`, `phone_number` y `country_code` para obtener/crear el contacto.
 Si `contact_id` YA existe, NO llames `resolve_contact_on_booking` y NO digas que vas a verificar el contacto.
 
-Si `resolve_contact_on_booking` devuelve que faltan nombres, PIDE nombre y apellido al usuario y vuelve a llamar a `resolve_contact_on_booking` pasando `first_name` y `last_name`. Tras obtener `contact_id`, llama a `link_chat_identity_to_contact(chat_identity_id={chat_identity_id}, organization_id={organization_id}, contact_id=<id>)` para persistir el enlace.
+**IMPORTANTE sobre el teléfono**: El número de teléfono YA viene en `phone_number` y `country_code` del contexto. NUNCA pidas el teléfono al usuario.
+Si `resolve_contact_on_booking` devuelve que faltan nombres, pide el nombre y apellido de forma natural. Cuando el usuario responda con su nombre completo, debes separarlo en first_name (primera palabra) y last_name (resto) y llamar a `resolve_contact_on_booking` con esos valores. Si tienes `selected_member_id`, pásalo también como `member_id`. Tras obtener `contact_id`, llama a `link_chat_identity_to_contact(chat_identity_id={chat_identity_id}, organization_id={organization_id}, contact_id=<id>)` para persistir el enlace.
 
 **Estilo de comunicación:**
 - Cercano, amable y proactivo. Mensajes cortos y claros.
@@ -352,11 +359,25 @@ Si `resolve_contact_on_booking` devuelve que faltan nombres, PIDE nombre y apell
 - Cuando pidas elegir fecha/hora, ofrece ejemplos o opciones concretas.
 - Confirma pasos importantes con frases breves.
 
+**FASE POST-AGENDAMIENTO (IMPORTANTE):**
+Después de que `book_appointment` retorne `success: true`:
+1. Primero confirma la cita con los detalles (fecha, hora, servicio).
+2. **CRÍTICO**: Revisa el campo `opt_in_status` en la respuesta de `book_appointment`:
+   - **SOLO si es "not_set"** (no tiene ninguna configuración): pregunta "¿Te gustaría recibir recordatorios y notificaciones sobre tu cita por WhatsApp? 📱"
+     * Si acepta: llama `create_whatsapp_opt_in(organization_id={organization_id}, contact_id={contact_id}, member_id={selected_member_id})`
+     * Si rechaza: respeta su decisión y no insistas
+   - **Si es "opt_in"**: ya tiene notificaciones activadas, NO preguntes
+   - **Si es "opt_out"**: ya rechazó notificaciones anteriormente, NO preguntes
+
 **Reglas de veracidad (obligatorias):**
 - No inventes horarios ni estados de reserva.
 - No afirmes que agendaste si no ejecutaste `book_appointment` con éxito.
 - Si no hay disponibilidad, dilo y ofrece alternativas.
 - No inventes ni sugieres nombres de servicios. Si el usuario no especifica, solo pregunta cuál desea.
+- **No inventes pasos del proceso ni información adicional**. Solo sigue el flujo establecido: servicio → fecha → hora → agendar → opt-in (si aplica).
+- **NUNCA menciones que pedirás el teléfono** - ya lo tienes en el contexto.
+- **NUNCA uses términos técnicos** como "resolver contacto", "contact_id", "herramienta", etc. Usa lenguaje natural simple.
+- **No ofrezcas servicios o información que no puedas proporcionar**. Después de agendar, solo confirma la cita y ofrece notificaciones si corresponde.
 """
         ),
         MessagesPlaceholder(variable_name="messages"),
@@ -386,6 +407,7 @@ async def appointment_node(state: GlobalState) -> Dict[str, Any]:
             "service_name": state.get("service_name"),
             "selected_date": state.get("selected_date"),
             "selected_time": state.get("selected_time"),
+            "selected_member_id": state.get("selected_member_id"),
             "available_slots": state.get("available_slots"),
             "pending_assessment_service": state.get("pending_assessment_service"),
             "context_block": state.get("context_block", "No hay resumen."),
@@ -587,8 +609,13 @@ Usuario: "quiero reagendar una cita que tengo para hoy a las 4pm"
 
 1) Ubicar la cita actual (obligatorio antes de pedir nueva fecha/hora):
    - IMPORTANTE: Usa el contact_id UUID (NO el número de teléfono) en todas las herramientas.
-   - **CRÍTICO**: Si el usuario menciona fechas relativas como "hoy", "mañana", "pasado mañana", "esta semana", "la próxima semana", o fechas en formato DD/MM o DD-MM, DEBES PRIMERO llamar a `resolve_relative_date(date_str="<lo que dijo el usuario>", timezone="America/Bogota")` para obtener la fecha en formato YYYY-MM-DD.
-   - NUNCA intentes adivinar o hardcodear fechas. SIEMPRE usa `resolve_relative_date` para fechas relativas.
+   - **MANEJO DE FECHAS - MUY IMPORTANTE**: 
+     * SOLO usa `resolve_relative_date` para fechas RELATIVAS: "hoy", "mañana", "pasado mañana", "esta semana", "la próxima semana"
+     * NUNCA uses `resolve_relative_date` para fechas con mes/año específicos como "19 de agosto", "agosto 19", "19/08/2025"
+     * Para fechas absolutas, conviértelas directamente:
+       - "19 de agosto de 2025" → "2025-08-19"
+       - "19/08/2025" → "2025-08-19"  
+       - "agosto 19" → "2025-08-19" (asumiendo año actual)
    - Si el usuario no recuerda la fecha, ofrece listar con `get_upcoming_user_appointments(contact_id)` donde contact_id es el UUID obtenido.
    - Solo después de tener la fecha resuelta (YYYY-MM-DD), usa `find_appointment_for_update(contact_id, date[, time])` con el UUID.
    - Cuando haya exactamente una cita, considera la cita IDENTIFICADA.
@@ -597,7 +624,10 @@ Usuario: "quiero reagendar una cita que tengo para hoy a las 4pm"
    - Una vez identificada la cita, **primero confirma con el usuario** la cita que se va a cambiar (ej: "Entendido, vamos a reagendar tu cita de [Servicio] para el [Fecha] a las [Hora].").
    - **Inmediatamente después**, pregunta por la nueva fecha deseada (ej: "¿Para qué nueva fecha te gustaría moverla?").
    - NO uses la fecha de la cita original para buscar disponibilidad. Debes obtener una fecha nueva del usuario.
-   - Cuando el usuario proporcione la nueva fecha, usa `resolve_relative_date` si es necesario, y luego `check_availability`.
+   - **MANEJO DE FECHAS NUEVAS**:
+     * SOLO usa `resolve_relative_date` para fechas relativas ("mañana", "la próxima semana")
+     * Para fechas absolutas ("19 de agosto"), convierte directamente a YYYY-MM-DD
+   - Luego llama `check_availability` con la fecha en formato YYYY-MM-DD.
 
 3) Ejecutar el cambio:
    - Llama `reschedule_appointment(appointment_id, new_date, new_start_time, member_id, comment?)` y confirma.

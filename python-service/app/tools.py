@@ -333,8 +333,18 @@ def resolve_relative_date(date_text: str, timezone: str = "America/Bogota") -> D
         return {"success": False, "message": f"Error resolviendo fecha: {e}"}
 
 @tool
-async def resolve_contact_on_booking(organization_id: str, phone_number: str, country_code: str, first_name: Optional[str] = None, last_name: Optional[str] = None) -> Dict[str, Any]:
-    """Busca un contacto por teléfono o lo crea si no existe. Devuelve un dict JSON-serializable."""
+async def resolve_contact_on_booking(organization_id: str, phone_number: str, country_code: str, member_id: str, first_name: Optional[str] = None, last_name: Optional[str] = None) -> Dict[str, Any]:
+    """Busca un contacto por teléfono o lo crea si no existe. Devuelve un dict JSON-serializable.
+    
+    Args:
+        organization_id: ID de la organización
+        phone_number: Número de teléfono del contacto
+        country_code: Código de país
+        member_id: ID del miembro (requerido para crear nuevos contactos)
+        first_name: Nombre del contacto (requerido para crear nuevo)
+        last_name: Apellido del contacto (requerido para crear nuevo)
+    """
+    print(f"[resolve_contact_on_booking] ▶️ Inicio | org={organization_id}, phone={phone_number}, cc={country_code}, fn={first_name}, ln={last_name}, member={member_id}")
     try:
         response = await run_db(lambda: supabase_client
                                 .table('contacts')
@@ -344,12 +354,18 @@ async def resolve_contact_on_booking(organization_id: str, phone_number: str, co
                                 .eq('country_code', country_code)
                                 .maybe_single()
                                 .execute())
-        if response.data:
+        print(f"[resolve_contact_on_booking] 🔍 Búsqueda de contacto - Resultado: {response.data if response else 'No response'}")
+        if response and response.data:
             contact_id = response.data['id']
+            print(f"[resolve_contact_on_booking] ✅ Contacto existente encontrado: {contact_id}")
             return {"success": True, "contact_id": contact_id, "message": "Contacto reconocido.", "is_existing_contact": True}
         else:
+            print(f"[resolve_contact_on_booking] 📝 Contacto no encontrado, intentando crear...")
             if not first_name or not last_name:
+                print(f"[resolve_contact_on_booking] ⚠️ Faltan datos: first_name={first_name}, last_name={last_name}")
                 return {"success": False, "message": "Faltan nombre y apellido para crear el contacto."}
+            
+            print(f"[resolve_contact_on_booking] 📝 Creando contacto: {first_name} {last_name} con created_by={member_id}")
             insert_response = await run_db(lambda: supabase_client
                                            .table('contacts')
                                            .insert({
@@ -358,14 +374,21 @@ async def resolve_contact_on_booking(organization_id: str, phone_number: str, co
                                                'country_code': country_code,
                                                'first_name': first_name,
                                                'last_name': last_name,
+                                               'created_by': member_id,  # Usar member_id de profiles (siempre requerido)
                                            })
                                            .execute())
+            print(f"[resolve_contact_on_booking] 🔍 Respuesta de inserción: {insert_response.data if insert_response else 'No response'}")
             if not insert_response or not getattr(insert_response, 'data', None):
+                print(f"[resolve_contact_on_booking] ❌ Error: No se pudo crear el contacto")
                 return {"success": False, "message": "No fue posible crear el contacto"}
             new_row = insert_response.data[0] if isinstance(insert_response.data, list) else insert_response.data
             new_contact_id = new_row['id']
+            print(f"[resolve_contact_on_booking] ✅ Contacto creado exitosamente: {new_contact_id}")
             return {"success": True, "contact_id": new_contact_id, "message": "Nuevo contacto creado.", "is_existing_contact": False}
     except Exception as e:
+        print(f"[resolve_contact_on_booking] ❌ Excepción: {e}")
+        import traceback
+        traceback.print_exc()
         return {"success": False, "message": f"Error al resolver contacto: {e}"}
 
 def _to_datetime(the_date: date, time_str: str):
@@ -565,7 +588,7 @@ async def book_appointment(organization_id: str, contact_id: str, service_id: st
                                      .limit(1)
                                      .maybe_single()
                                      .execute())
-        opt_in_status = auth_response.data['authorization_type'] if auth_response.data else "not_set"
+        opt_in_status = auth_response.data['authorization_type'] if auth_response and auth_response.data else "not_set"
         print(f"[book_appointment] 🔐 WhatsApp opt-in status: {opt_in_status}")
         
         # Retornar como dict para que sea JSON serializable
@@ -585,13 +608,18 @@ async def book_appointment(organization_id: str, contact_id: str, service_id: st
 async def create_whatsapp_opt_in(
     organization_id: str,
     contact_id: str,
+    member_id: str,
     user_agent: Optional[str] = None,
     evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Crea un registro de autorización (opt-in) para WhatsApp.
 
-    - Guarda channel='whatsapp'.
-    - Permite registrar `user_agent` y `evidence` (json) para auditoría.
+    Args:
+        organization_id: ID de la organización
+        contact_id: ID del contacto
+        member_id: ID del miembro (requerido para created_by)
+        user_agent: User agent opcional para auditoría
+        evidence: Evidencia adicional opcional (json) para auditoría
     """
     try:
         payload: Dict[str, Any] = {
@@ -600,7 +628,7 @@ async def create_whatsapp_opt_in(
             'authorization_type': 'opt_in',
             'channel': 'whatsapp',
             'is_active': True,
-            'created_by': 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'
+            'created_by': member_id  # Usar member_id de profiles
         }
         if user_agent:
             payload['user_agent'] = user_agent
