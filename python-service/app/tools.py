@@ -814,6 +814,7 @@ async def reschedule_appointment(appointment_id: str, new_date: str, new_start_t
             'end_time': end_dt.strftime('%H:%M:%S'),
             'member_id': str(member_id),
             'notes': new_notes,
+            'status': 'programada',  # Citas reagendadas quedan como programadas
         }
 
         # 4) Actualizar
