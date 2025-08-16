@@ -4,11 +4,11 @@ const { createClient } = require('@supabase/supabase-js');
 
 // Configuración de Supabase
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const geminiApiKey = process.env.GEMINI_API_KEY;
 
-if (!supabaseUrl || !supabaseAnonKey) {
-    console.error('❌ Error: SUPABASE_URL y SUPABASE_ANON_KEY deben estar configuradas en las variables de entorno');
+if (!supabaseUrl || !supabaseServiceKey) {
+    console.error('❌ Error: SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY deben estar configuradas en las variables de entorno');
     process.exit(1);
 }
 
@@ -17,7 +17,8 @@ if (!geminiApiKey) {
     process.exit(1);
 }
 
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
+// Usar SERVICE_ROLE_KEY para bypasear RLS en Storage
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
 const genAI = new GoogleGenerativeAI(geminiApiKey);
 
 /**
@@ -174,6 +175,7 @@ async function handleUnsupportedMedia(mediaUrl, mediaType, organizationId, chatI
     // 4. Mensaje de fallback
     const fallbackMessages = {
       'video': 'He recibido tu video, pero no puedo procesarlo automáticamente. ¿Te gustaría hablar con un asesor para revisarlo juntos?',
+      'file': 'He recibido tu documento, pero no puedo procesarlo automáticamente. ¿Te gustaría hablar con un asesor para revisarlo juntos?',
       'document': 'He recibido tu documento, pero no puedo procesarlo automáticamente. ¿Te gustaría hablar con un asesor para revisarlo juntos?',
       'default': 'He recibido tu archivo, pero no puedo procesarlo automáticamente. ¿Te gustaría hablar con un asesor?'
     };
@@ -313,7 +315,7 @@ async function processMedia(payload, organizationId, chatIdentityId) {
       
     case 'file': // Documentos en Gupshup se llaman 'file'
       if (!payload?.url) return null;
-      return await handleUnsupportedMedia(payload.url, 'document', organizationId, chatIdentityId);
+      return await handleUnsupportedMedia(payload.url, 'file', organizationId, chatIdentityId);
     
     case 'location':
       return await handleLocation(payload, organizationId, chatIdentityId);

@@ -6,14 +6,15 @@ const { createClient } = require('@supabase/supabase-js');
 
 // Configuración de Supabase
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!supabaseUrl || !supabaseAnonKey) {
-    console.error('❌ Error: SUPABASE_URL y SUPABASE_ANON_KEY deben estar configuradas en las variables de entorno');
+if (!supabaseUrl || !supabaseServiceKey) {
+    console.error('❌ Error: SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY deben estar configuradas en las variables de entorno');
     process.exit(1);
 }
 
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
+// Usar SERVICE_ROLE_KEY para tener acceso completo a las tablas
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
 /**
  * @route POST /internal/notify/escalation
@@ -26,6 +27,14 @@ const supabase = createClient(supabaseUrl, supabaseAnonKey);
  */
 router.post('/notify/escalation', async (req, res) => {
   const { organization_id, chat_identity_id, phone_number, country_code, reason } = req.body;
+  
+  console.log(`[ESCALATION] Request recibido:`, {
+    organization_id,
+    chat_identity_id,
+    phone_number,
+    country_code,
+    reason: reason?.substring(0, 50) + '...'
+  });
 
   if (!organization_id || !chat_identity_id || !phone_number || !country_code || !reason) {
     return res.status(400).json({ error: 'Faltan parámetros requeridos: organization_id, chat_identity_id, phone_number, country_code, reason' });
@@ -42,21 +51,51 @@ router.post('/notify/escalation', async (req, res) => {
     }
 
     // 2) Obtener destinatario (asesor) desde internal_notifications_config
-    const { data: notifCfg, error: notifErr } = await supabase
+    console.log(`[ESCALATION] Buscando config para org_id: ${organization_id}`);
+    const { data: notifCfgArray, error: notifErr } = await supabase
       .from('internal_notifications_config')
       .select('is_enabled, recipient_phone, country_code')
-      .eq('organization_id', organization_id)
-      .single();
-    if (notifErr || !notifCfg || notifCfg.is_enabled !== true) {
-      return res.status(400).json({ error: 'Notificaciones internas no habilitadas o sin configuración para la organización.' });
+      .eq('organization_id', organization_id);
+    
+    // Debug detallado para identificar el problema
+    if (notifErr) {
+      console.error(`[ESCALATION] Error en consulta Supabase:`, notifErr);
+      return res.status(400).json({ error: `Error obteniendo configuración: ${notifErr.message}` });
     }
+    
+    console.log(`[ESCALATION] Registros encontrados: ${notifCfgArray ? notifCfgArray.length : 0}`);
+    
+    if (!notifCfgArray || notifCfgArray.length === 0) {
+      console.error(`[ESCALATION] No se encontró configuración para org_id: ${organization_id}`);
+      return res.status(400).json({ error: 'No se encontró configuración de notificaciones para esta organización.' });
+    }
+    
+    if (notifCfgArray.length > 1) {
+      console.warn(`[ESCALATION] Se encontraron ${notifCfgArray.length} configuraciones para org_id: ${organization_id}. Usando la primera.`);
+    }
+    
+    // Tomar el primer registro
+    const notifCfg = notifCfgArray[0];
+    
+    if (notifCfg.is_enabled !== true) {
+      console.error(`[ESCALATION] Notificaciones deshabilitadas. is_enabled = ${notifCfg.is_enabled}`);
+      return res.status(400).json({ error: 'Las notificaciones internas están deshabilitadas para esta organización.' });
+    }
+    
+    console.log(`[ESCALATION] Config encontrada:`, {
+      is_enabled: notifCfg.is_enabled,
+      recipient_phone: notifCfg.recipient_phone,
+      country_code: notifCfg.country_code
+    });
 
     const advisorCountry = (notifCfg.country_code || '').replace('+', '');
     const advisorPhone = String(notifCfg.recipient_phone || '').replace(/\D/g, '');
     if (!advisorCountry || !advisorPhone) {
+      console.error(`[ESCALATION] Datos de destinatario inválidos. country_code: '${notifCfg.country_code}' -> '${advisorCountry}', phone: '${notifCfg.recipient_phone}' -> '${advisorPhone}'`);
       return res.status(400).json({ error: 'Configuración de destinatario inválida.' });
     }
     const destination = `${advisorCountry}${advisorPhone}`;
+    console.log(`[ESCALATION] Número destino formateado: ${destination}`);
 
     // 3) Nombre del cliente: buscar en contacts por phone_number y country_code; si no, usar el número
     const { data: contactRow } = await supabase

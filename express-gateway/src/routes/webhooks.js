@@ -276,10 +276,22 @@ router.post('/gupshup', async (req, res) => {
       let mediaMeta = null; // { mediaUrl, mediaType, mimeType }
       try {
         if (msgType && msgType !== 'text') {
-          const mediaResult = await processMedia(payloadInner, organization_id, chatIdentityId);
+          // Para media, necesitamos pasar el tipo correcto y la URL
+          const mediaPayload = {
+            type: msgType,  // 'audio', 'image', 'video', etc.
+            url: payloadInner?.url || payloadInner?.payload?.url,  // La URL puede estar en diferentes lugares
+            ...payloadInner  // Incluir todo el payload por si hay más datos
+          };
+          
+          console.log(`📨 [${processingId}] Procesando media tipo ${msgType}:`, JSON.stringify(mediaPayload).substring(0, 200));
+          
+          const mediaResult = await processMedia(mediaPayload, organization_id, chatIdentityId);
           if (mediaResult && mediaResult.processedText) {
             processedText = mediaResult.processedText;
             mediaMeta = { mediaUrl: mediaResult.mediaUrl, mediaType: mediaResult.mediaType, mimeType: mediaResult.mimeType };
+            console.log(`✅ [${processingId}] Media procesada exitosamente: ${processedText.substring(0, 100)}...`);
+          } else {
+            console.log(`⚠️ [${processingId}] No se pudo procesar media, usando mensaje por defecto`);
           }
         }
       } catch (e) {
@@ -292,12 +304,18 @@ router.post('/gupshup', async (req, res) => {
       // ... (lógica de processMedia iría aquí si se necesita)
 
       // 7. Guardar Mensaje Entrante
+      // Para contact y location, guardar como text ya que no son tipos multimedia válidos en el enum
+      let dbMediaType = mediaMeta?.mediaType;
+      if (dbMediaType === 'contact' || dbMediaType === 'location') {
+        dbMediaType = null; // Guardar como NULL en media_type ya que no es un archivo multimedia
+      }
+      
       const chatRow = {
         chat_identity_id: chatIdentityId,
         direction: 'incoming',
         message: msgType === 'text' ? messageContent : '',
         processed_text: processedText,
-        media_type: mediaMeta?.mediaType || null,
+        media_type: dbMediaType || null,
         media_url: mediaMeta?.mediaUrl || null,
         media_mime_type: mediaMeta?.mimeType || null,
         platform_message_id: messageId,
