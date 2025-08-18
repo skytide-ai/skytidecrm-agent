@@ -1,0 +1,99 @@
+version: '3.8'
+
+services:
+  # Servicio Python - Agente principal
+  python-service:
+    build:
+      context: ./python-service
+      dockerfile: Dockerfile
+    container_name: skytidecrm-agent-python
+    ports:
+      - "8000:8000"
+    environment:
+      # Variables de entorno para Supabase
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - SUPABASE_DB_PASSWORD=${SUPABASE_DB_PASSWORD}
+      
+      # Variables de entorno para Redis (checkpointing)
+      - REDIS_URL=${REDIS_URL}
+
+      # Variables de entorno para OpenAI
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_CHAT_MODEL=${OPENAI_CHAT_MODEL:-gpt-4o} # Opcional
+
+      # Variables de entorno para Gemini (LLM alternativo)
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - USE_GEMINI=${USE_GEMINI:-false}
+
+      # Variables para Langfuse (Observabilidad)
+      - LANGFUSE_HOST=${LANGFUSE_HOST}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+
+      # Variables de configuración adicionales
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+    networks:
+      - skytidecrm-network
+    depends_on:
+      - express-gateway
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Gateway Express - API Gateway
+  express-gateway:
+    build:
+      context: ./express-gateway
+      dockerfile: Dockerfile
+    container_name: skytidecrm-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      # Puerto del gateway
+      - GATEWAY_PORT=8080
+
+      # URL del servicio Python para comunicación interna
+      - PYTHON_SERVICE_URL=http://python-service:8000
+
+      # Variables de entorno para Supabase
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+
+      # Variables de entorno para Gemini AI
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+
+      # Variables de entorno para notificaciones Gupshup
+      - GUPSHUP_NOTIF_API_KEY=${GUPSHUP_NOTIF_API_KEY}
+      - GUPSHUP_NOTIF_SOURCE=${GUPSHUP_NOTIF_SOURCE}
+      - GUPSHUP_ESCALATION_TEMPLATE_ID=${GUPSHUP_ESCALATION_TEMPLATE_ID}
+      - GUPSHUP_NOTIF_APP_NAME=${GUPSHUP_NOTIF_APP_NAME}
+
+      # Variables de entorno para autenticación y webhooks
+      - NODE_ENV=production
+
+      # Variables adicionales que puedas necesitar
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-default-secret}
+    networks:
+      - skytidecrm-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  skytidecrm-network:
+    driver: bridge
+    name: skytidecrm-network
+
+# Volumes para persistencia si es necesario
+volumes:
+  python-data:
+    driver: local
