@@ -84,7 +84,6 @@ coverage.xml
 
 # Docker
 .dockerignore
-docker-compose.yml
 
 # IDEs
 .idea/
