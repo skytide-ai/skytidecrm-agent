@@ -10,7 +10,7 @@ En la pantalla de configuración de Easypanel, selecciona:
 - **URL del repositorio**: `https://github.com/skytide-ai/skytidecrm-agent.git`
 - **Rama**: `main` (o `PydanticAgent` si quieres usar la rama actual)
 - **Ruta de compilación**: `/` (dejar como está)
-- **Archivo Docker Compose**: `docker-compose.yml` (dejar como está)
+- **Archivo Docker Compose**: `docker-compose.prod.yml` (⚠️ IMPORTANTE: Usar el archivo .prod.yml para Easypanel)
 
 ### 2. Variables de Entorno
 
@@ -23,7 +23,6 @@ Después de guardar la configuración inicial, necesitas configurar las siguient
 SUPABASE_URL=https://tu-proyecto.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=tu-service-role-key
 SUPABASE_ANON_KEY=tu-anon-key
-SUPABASE_DB_PASSWORD=tu-db-password
 
 # OpenAI
 OPENAI_API_KEY=sk-proj-...
