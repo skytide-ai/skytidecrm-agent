@@ -1,4 +1,5 @@
-from typing import TypedDict, Annotated, List, Optional
+from typing_extensions import TypedDict
+from typing import Annotated, List, Optional, Any, Dict
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
@@ -9,19 +10,38 @@ class GlobalState(TypedDict):
     """
     messages: Annotated[List[BaseMessage], add_messages]
     organization_id: str
-    phone: str # Número completo (platform_user_id) que viene desde Gupshup
-    phone_number: Optional[str] # Número nacional (dial_code) separado por Gupshup
-    country_code: Optional[str] # Código de país (con +) desde Gupshup
+    phone: str
+    phone_number: Optional[str]
+    country_code: Optional[str]
     contact_id: Optional[str]
     chat_identity_id: Optional[str]
     service_id: Optional[str] = None
     service_name: Optional[str] = None
     requires_assessment: Optional[bool] = None
-    available_slots: Optional[list] = None
+    available_slots: Optional[List[Dict[str, Any]]] = None
+    selected_date: Optional[str] = None
+    selected_time: Optional[str] = None
+    selected_member_id: Optional[str] = None
     appointment_date_query: Optional[str] = None
-    focused_appointment: Optional[dict] = None # Para guardar la cita que se está discutiendo
-    ready_to_book: Optional[bool] = None # Bandera para indicar que está listo para agendar
-    selected_date: Optional[str] = None # Fecha seleccionada para el agendamiento (YYYY-MM-DD)
-    selected_time: Optional[str] = None # Hora seleccionada para el agendamiento (HH:MM)
-    selected_member_id: Optional[str] = None # ID del miembro para el horario seleccionado
-    next_agent: Optional[str] = None 
+    focused_appointment: Optional[dict] = None
+    ready_to_book: Optional[bool] = None
+    selected_date: Optional[str] = None
+    selected_time: Optional[str] = None
+    selected_member_id: Optional[str] = None
+    next_agent: Optional[str] = None
+    
+    # --- CAMPO AÑADIDO PARA EL RESULTADO DEL KNOWLEDGE AGENT ---
+    knowledge_result: Optional[Any] = None
+    
+    # --- CAMPO PARA LA MÁQUINA DE ESTADOS DE AGENDAMIENTO ---
+    booking_status: Optional[str] = None
+    
+    # --- CAMPO PARA EL ENRUTADOR PRINCIPAL ---
+    current_flow: Optional[str] = None
+    context_block: Optional[str] = None
+    
+    # --- CAMPO PARA SERVICIOS QUE REQUIEREN VALORACIÓN ---
+    pending_assessment_service: Optional[Dict[str, Any]] = None
+    
+    # --- CAMPO PARA RASTREAR SI ESTAMOS ESPERANDO RESPUESTA DE OPT-IN ---
+    waiting_opt_in_response: Optional[bool] = None

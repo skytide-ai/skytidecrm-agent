@@ -1,9 +1,10 @@
+
 # PLAN DE DESARROLLO - AGENTE IA CONVERSACIONAL
 
 ## 1. Arquitectura del Sistema ✅ COMPLETADA
 
 ### 1.1. Stack Tecnológico Definido ✅
-- **Frontend**: Pydantic AI + LangGraph + Zep Cloud
+- **Frontend**: Pydantic AI + LangGraph
 - **Base de datos**: Supabase (PostgreSQL)
 - **API Gateway**: Express.js
 - **Servicio Python**: FastAPI
@@ -130,7 +131,7 @@ Pruebas → Express Gateway → Python Service
 - **Workflow**: ✅ Definido con nodos especializados y routing inteligente
 - **MemorySaver**: ✅ Configurado para persistencia de estado entre mensajes
 
-### 3.3. Integración con Zep Cloud ✅
+### 3.3. Integración con Zep Cloud ❌ Eliminada
 - **Cliente Zep**: ✅ Configurado y funcional
 - **Gestión de sesiones**: ✅ Historia de conversación persistente
 - **Optimización**: ✅ Simplificado gracias a MemorySaver de LangGraph
@@ -274,6 +275,13 @@ Supabase Storage → chat_messages → Python service (texto procesado)
 - **Escalabilidad**: 🔄 Consideraciones para múltiples instancias
 - **⭐ Media Caching**: 🔄 Optimización de acceso a archivos frecuentes
 
+### 6.5. Mejores Prácticas LangGraph/LangChain 🔧 NUEVO
+- **Checkpointer duradero (Redis)**: Migrar de `MemorySaver` a `langgraph-redis` para hilos concurrentes multi-tenant.
+- **Fallback del router**: Añadir reintentos guiados para `with_structured_output(Route)` en caso de error de parseo.
+- **Outputs homogéneos de tools**: Estandarizar respuestas que mutan estado con `{ action: string, ... }` (ej. `reset_appointment_context`, `select_appointment_slot`).
+- **Límite de recursión**: Establecer `recursion_limit` por defecto en 25 y elevar bajo diagnóstico.
+- **Observabilidad**: Integrar LangSmith o, mínimo, logs estructurados con `thread_id` y `tool_call_id` por paso.
+
 ---
 
 ## RESUMEN DE CAMBIOS ARQUITECTÓNICOS IMPORTANTES ✅
@@ -293,7 +301,7 @@ Supabase Storage → chat_messages → Python service (texto procesado)
   - ✅ Variables de entorno actualizadas (OPENAI_API_KEY)
   - ✅ Configuración simplificada sin headers adicionales
 
-### **⭐ MIGRACIÓN COMPLETA A ZEP CLOUD** ✅ COMPLETADO
+### **⭐ MIGRACIÓN COMPLETA A ZEP CLOUD** ❌ Eliminada
 - **Problema Inicial**: Implementación obsoleta con `zep-python` y APIs deprecated
 - **Solución**: Migración completa a `zep-cloud` con mejores prácticas
 - **Beneficios Implementados**:
@@ -396,12 +404,283 @@ Python(Supervisor → Agentes) → saveOutgoing → Response
 
 ---
 
+---
+
+## 8. 🔄 FASE 8: REFACTORIZACIÓN A FLUJO DE CONVERSACIÓN CON NODOS (ARQUITECTURA RETELL)
+
+### 8.1. Justificación del Cambio Arquitectónico
+
+La arquitectura de "Agente Único" ha demostrado ser propensa a errores de lógica y bucles de conversación, ya que delega demasiado control de flujo a la interpretación de un único LLM con un prompt muy complejo.
+
+Inspirados en las mejores prácticas de frameworks como [Retell AI](https://docs.retellai.com/build/conversation-flow/overview), adoptaremos una arquitectura de **Grafo de Estados Explícito** utilizando `LangGraph`. Esto nos dará un control total y predecible sobre el flujo de la conversación, eliminando la ambigüedad y facilitando enormemente la depuración.
+
+**Beneficios Esperados:**
+-   **Robustez y Previsibilidad:** El flujo conversacional se define en el código a través de nodos y aristas, no en un prompt.
+-   **Depuración Sencilla:** Los logs mostrarán claramente el paso de un nodo a otro, permitiendo identificar fallos al instante.
+-   **Flexibilidad para Cambios de Intención:** Un nodo "Supervisor/Enrutador" central permitirá saltar entre diferentes flujos (agendamiento, conocimiento, etc.) de forma inteligente.
+-   **Mantenibilidad a Largo Plazo:** Añadir nuevos pasos o flujos será tan simple como añadir nuevos nodos y aristas al grafo.
+
+### 8.2. Plan de Migración por Fases
+
+#### **FASE 8.2.1: Creación del Grafo de Nodos Especializados**
+
+-   [ ] **Definir Nodos Principales en `main.py`**:
+    -   `supervisor_node`: Punto de entrada que analiza la intención del usuario y el estado actual para enrutar la conversación.
+    -   `knowledge_node`: Llama a la herramienta `knowledge_search` y formatea la respuesta.
+    -   `appointment_node`: Un sub-grafo que contendrá toda la lógica de agendamiento.
+    -   `cancellation_node`: Un sub-grafo para el flujo de cancelación de citas.
+    -   `confirmation_node`: Nodo final para resumir citas y gestionar opt-ins.
+    -   `escalation_node`: Nodo de seguridad para escalar a un humano.
+
+-   [ ] **Implementar el `supervisor_node`**:
+    -   Crear un prompt específico para este nodo, cuyo único objetivo es decidir a qué otro nodo debe ir la conversación.
+    -   Debe devolver una decisión estructurada, por ejemplo: `{"next": "knowledge_node"}`.
+
+-   [ ] **Configurar las Aristas Condicionales**:
+    -   En `main.py`, conectar el `supervisor_node` a los demás nodos principales usando `workflow.add_conditional_edges`.
+
+#### **FASE 8.2.2: Construcción del Sub-Grafo de Agendamiento (`appointment_graph.py`)**
+
+-   [ ] **Crear `appointment_graph.py`**: Nuevo archivo para contener la lógica del flujo de agendamiento.
+-   [ ] **Definir Nodos del Sub-Grafo**:
+    -   `check_service_node`: Verifica si `service_id` existe.
+    -   `search_service_node`: Llama a la herramienta `knowledge_search`.
+    -   `confirm_service_node`: Pide al usuario que confirme el servicio encontrado.
+    -   `save_service_node`: Llama a la herramienta `update_service_in_state`.
+    -   `get_date_node`: Pregunta por la fecha.
+    -   `check_availability_node`: Llama a la herramienta `check_availability`.
+    -   `select_slot_node`: Llama a la herramienta `select_appointment_slot`.
+    -   `resolve_contact_node`: Llama a `resolve_contact_on_booking`.
+    -   `book_appointment_node`: Llama a la herramienta final `book_appointment`.
+-   [ ] **Conectar Nodos del Sub-Grafo**: Crear un `StateGraph` dentro de este archivo que defina el flujo lineal del agendamiento.
+-   [ ] **Integrar Sub-Grafo en `main.py`**: El `supervisor_node` enrutará al `appointment_graph` cuando la intención sea agendar.
+
+#### **FASE 8.2.3: Refactorización de Herramientas y Estado**
+
+-   [ ] **Mover Herramientas a `tools.py`**: Crear un archivo `tools.py` para centralizar todas las funciones de herramientas (`knowledge_search`, `check_availability`, etc.), eliminándolas de `master_agent.py`.
+-   [ ] **Eliminar `master_agent.py`**: Este archivo ya no será necesario, ya que la lógica estará distribuida en los nodos.
+-   [ ] **Actualizar `state.py`**: Añadir un campo `current_flow: Optional[str]` al `GlobalState` para que el supervisor siempre sepa en qué flujo se encuentra el usuario (ej: "agendamiento", "conocimiento").
+
+#### **FASE 8.2.4: Testing End-to-End**
+
+-   [ ] **Prueba de Flujo de Agendamiento Lineal**: Validar que el sub-grafo de agendamiento funciona de principio a fin sin interrupciones.
+-   [ ] **Prueba de Salto de Intención**:
+    -   Iniciar un flujo de agendamiento.
+    -   A mitad de camino, hacer una pregunta de conocimiento.
+    -   Verificar que el `supervisor_node` enruta correctamente al `knowledge_node` y luego puede regresar al flujo de agendamiento.
+-   [ ] **Prueba de Cambio de Contexto Completo**:
+    -   Iniciar un agendamiento para "masaje".
+    -   Decir "mejor quiero una limpieza facial".
+    -   Verificar que el supervisor reinicia el sub-grafo de agendamiento.
+
+---
+
 ## 🎯 PRÓXIMOS PASOS INMEDIATOS
 
-1. ✅ **🔑 COMPLETADO - Configuración OpenAI directo** - Sin comisiones de terceros
-2. **🔑 Configurar `OPENAI_API_KEY`** - REQUERIDO para funcionalidad LLM
-3. **🔑 Configurar `GEMINI_API_KEY`** - CRÍTICO para funcionalidad de media
-4. **🧪 Testing con archivos reales** - Validar transcripción y descripción
-5. ✅ **📚 COMPLETADO - Documentar configuración** - Guía completa de variables de entorno
-6. **🔍 Implementar búsqueda semántica real** - KnowledgeAgent con datos de Supabase
-7. ✅ **🧪 COMPLETADO - Testing sistema completo** - Integración, errores, dependencias verificadas 
+1.  **Iniciar Fase 8.2.3**: Mover herramientas a `tools.py` y eliminar `master_agent.py`.
+2.  **Iniciar Fase 8.2.1**: Implementar `supervisor_node` y la estructura base del grafo en `main.py`.
+3.  **Iniciar Fase 8.2.2**: Construir el sub-grafo de agendamiento.
+4.  **Configurar Variables de Entorno**: `OPENAI_API_KEY` y `GEMINI_API_KEY` son críticas.
+5.  **Testing Progresivo**: Probar cada flujo a medida que se construye.
+
+## 9. 🔄 FASE 9: RECONSTRUCCIÓN TOTAL A ARQUITECTURA DE NODOS EXPERTOS (MODELO RETELL)
+
+### 9.1. Justificación y Análisis del Fallo
+
+Tras repetidos fracasos, se ha determinado que la arquitectura actual es fundamentalmente defectuosa. Aunque utiliza nodos, el control centralizado en un único `supervisor` que se re-ejecuta en cada turno crea bucles de conversación, ignora las entradas del usuario y provoca `timeouts`. El modelo de "supervisor" + "trabajadores tontos" ha fracasado.
+
+La solución es una reconstrucción completa para emular la arquitectura robusta de sistemas como Retell AI, basada en **Nodos Inteligentes (Agentes Expertos)** y un **control de flujo explícito a través de aristas condicionales**, donde la conversación permanece dentro de un nodo experto hasta que se resuelve su tarea o la intención del usuario cambia drásticamente.
+
+### 9.2. Plan de Reconstrucción
+
+#### **FASE 9.2.1: Transformar `knowledge_node` en el Primer Agente Experto (Prototipo)**
+
+-   [ ] **Crear `knowledge_agent_prompt.py`**:
+    -   Definir un prompt detallado que le dé al nodo la capacidad de razonar.
+    -   Instrucciones claras: si es un saludo, conversar; si es una pregunta, usar la herramienta `knowledge_search`.
+-   [ ] **Reescribir `knowledge_node` en `main.py`**:
+    -   Convertirlo en una cadena LangChain (Prompt + LLM + Herramientas).
+    -   El nodo ahora recibirá el estado y decidirá si llama a la herramienta o si genera una respuesta conversacional directamente.
+    -   La salida será siempre una `AIMessage`, que puede contener una llamada a herramienta o texto plano.
+
+#### **FASE 9.2.2: Transformar `appointment_node` en un Agente Experto Completo**
+
+-   [ ] **Eliminar el Sub-Grafo (`appointment_graph.py`)**: La lógica de agendamiento ya no estará en un grafo separado, sino dentro de la inteligencia del propio `appointment_node`.
+-   [ ] **Crear `appointment_agent_prompt.py`**:
+    -   Diseñar un prompt complejo que funcione como una máquina de estados conversacional.
+    -   Debe entender en qué paso del agendamiento se encuentra (ej: `buscando_servicio`, `pidiendo_fecha`, `seleccionando_hora`).
+    -   Debe saber qué herramienta llamar en cada paso (`knowledge_search`, `check_availability`, `book_appointment`).
+-   [ ] **Reescribir `appointment_node` en `main.py`**:
+    -   Implementarlo como una cadena LangChain (Prompt + LLM + Todas las herramientas de agendamiento).
+    -   La conversación **permanecerá dentro de este nodo** a través de múltiples turnos hasta que la cita se agende o el usuario cambie de intención.
+
+#### **FASE 9.2.3: Simplificar el Supervisor y las Conexiones del Grafo**
+
+-   [ ] **Redefinir el Rol del `supervisor`**:
+    -   Su único propósito será el enrutamiento inicial. No volverá a ejecutarse después de cada turno de un nodo experto.
+-   [ ] **Reestructurar las Aristas en `main.py`**:
+    -   Los nodos expertos (`knowledge_node`, `appointment_node`) ya no volverán al supervisor por defecto.
+    -   Se implementará una lógica de "auto-retorno" o un `edge` condicional que solo se active si la intención del usuario cambia drásticamente, forzando una re-evaluación del enrutamiento por parte del supervisor.
+
+#### **FASE 9.2.4: Testing del Nuevo Modelo**
+
+-   [ ] **Prueba de Conversación Casual**: Verificar que el `knowledge_node` responde a saludos sin buscar en la base de datos.
+-   [ ] **Prueba de Agendamiento Completo**: Realizar un agendamiento de principio a fin, verificando que la conversación se mantiene dentro del `appointment_node` y que este llama a las herramientas correctas en el orden correcto.
+-   [ ] **Prueba de Cambio de Intención**: Iniciar un agendamiento y luego hacer una pregunta. Verificar que el flujo puede salir del `appointment_node`, ser re-evaluado por el `supervisor` y entrar correctamente al `knowledge_node`.
+
+---
+
+## 10. 🔐 FASE 10: MEMORIA CONVERSACIONAL EN SUPABASE + CHECKPOINTER REDIS (SUSTITUYE ZEP) ✅ COMPLETADA
+
+### 10.1. Objetivo
+- Reemplazar Zep como capa de memoria para reducir costo/latencia y aumentar el control, manteniendo durabilidad del grafo con Redis.
+
+### 10.2. Alcance
+- Redis: checkpointer duradero para `LangGraph` y caché caliente de últimos N mensajes normalizados por hilo.
+- Supabase: memoria conversacional persistente (source of truth) con historial “normalizado” + resumen por hilo.
+- Sin nuevos vendors (no mem0 salvo que se solicite luego).
+
+### 10.3. Cambios en API Gateway (Express)
+- [X] Guardado de mensajes entrantes con campos adicionales en `chat_messages`:
+  - `processed_text text` (transcripción/descripción enviada al LLM)
+  - `media_type text`, `media_url text`, `artifacts jsonb` (opcional)
+- [X] Enviar al Python-service el `processedText` (si existe) como contenido del mensaje para contexto.
+- [X] Mantener caché en memoria de `chat_identity` → `contact_id` y `first_name` (TTL 24h).
+- [X] Buffer (debounce) 10s para consolidar mensajes en una sola invocación.
+- (Opcional) Push a Redis caché de conversación tras guardar en Supabase:
+  - Key: `chat:{organization_id}:{chat_identity_id}:messages`
+  - Operaciones sugeridas: `LPUSH` con mensaje normalizado y `LTRIM` para mantener N (p.ej., 25–50).
+
+### 10.4. Cambios en Python-service
+- [X] Sustituir `MemorySaver` por `RedisSaver` de `langgraph-checkpoint-redis` si `REDIS_URL` definido; fallback a `MemorySaver`.
+  - `pip install langgraph-checkpoint-redis redis`
+  - `REDIS_URL=redis://redis:6379` (o Upstash/ElastiCache)
+- [X] Nuevo módulo `app/memory.py`:
+  - `get_last_messages(chat_identity_id, n)` → lee de `chat_messages` (usa `message`/`processed_text`).
+  - `get_context_block(chat_identity_id)` → lee `thread_summaries.summary_text`.
+  - `upsert_thread_summary(...)` disponible (pendiente autosummarize).
+- [X] `main.py` usa exclusivamente Supabase para memoria (Zep retirado).
+
+### 10.5. Esquema Supabase
+- Tabla `chat_messages` (ya existente): agregar columna `processed_text text` (y opcional `artifacts jsonb`).
+- Nueva tabla `thread_summaries`:
+  - `id uuid pk default gen_random_uuid()`
+  - `organization_id uuid not null` (FK)
+  - `chat_identity_id uuid not null` (FK)
+  - `summary_text text not null`
+  - `updated_at timestamptz not null default now()`
+  - Índices por `(organization_id, chat_identity_id)`
+
+### 10.6. Configuración y variables de entorno
+- `REDIS_URL` (obligatoria)
+- Eliminadas variables `ZEP_*` del runtime.
+
+### 10.7. Plan de despliegue
+1) Migraciones Supabase: columnas nuevas + tabla `thread_summaries`.
+2) Actualizar gateway para persistir `processed_text` y (opcional) publicar a Redis caché de conversación.
+3) Añadir `langgraph-checkpoint-redis` y configurar `RedisSaver` en `main.py`.
+4) Implementar `memory.py` con lectura preferente desde Redis caché y fallback a Supabase; reemplazar referencias a Zep.
+5) Feature flag temporal: `USE_ZEP=false` → activar nueva memoria y checkpointer.
+6) Pruebas E2E: hilos con texto, audio e imagen; cancelación/confirmación/reagendamiento.
+
+### 10.8. Observabilidad
+- Logs con `thread_id` y tamaño de contexto (`last_messages_n`, tokens aprox. y si se usó `summary_text`).
+- Métricas: latencia promedio por turno, tasa de fallos, tamaño medio de `processed_text`, **cache hit-rate Redis** y latencia Redis.
+
+### 10.9. Riesgos y mitigación
+- Riesgo: pérdida de contexto al migrar. Mitigar haciendo doble escritura (Zep + Supabase) durante una ventana corta y validando equivalencias.
+- Riesgo: Redis no disponible. Mitigar con `ShallowRedisSaver` o fallback a in-memory en dev; alertas de salud.
+
+### 10.10. Criterios de aceptación
+- Checkpointer Redis activo y estable (reanudación correcta por `thread_id`).
+- Redis caché de últimos N operativo (hit-rate ≥ 80% en producción inicial) con fallback a Supabase.
+- `processed_text` persistido y usado para construir el historial.
+- Resumen por hilo actualizado y consultado en cada invocación.
+- Zep removido del camino crítico sin regresiones de UX.
+
+### 10.11. Buffer de mensajes (debounce 10s)
+- Objetivo: evitar múltiples invocaciones al servicio Python cuando el usuario envía varios mensajes cortos seguidos (ej.: "hola" → 3s → "cómo estás" → 5s → "qué limpiezas tienen?").
+- Diseño (Gateway):
+  - Mapa en memoria `pendingByChat` con clave `org:chatIdentityId` → { timer, items[] }.
+  - Al recibir un mensaje: guardar en Supabase (`chat_messages` con `processed_text`), agregar `processedText` normalizado a `items[]`, reiniciar timer a 10s.
+  - Al expirar el timer (10s sin nuevos mensajes): construir un único contenido combinando los `processedText` (p. ej., unidos por `\n`), enviar UNA sola solicitud a `/invoke` con ese contenido.
+  - Tamaño máximo configurable (p. ej. 3–5 mensajes por lote) para evitar prompts gigantes (si se excede, forzar flush anticipado).
+- Alternativa (si se prefiere más estructura):
+  - Enviar `batchedMessages: [{role: 'user', content: ...}, ...]` en el payload; el Python-service los insertará a su historial antes del turno actual. (Requiere pequeño cambio en `/invoke`).
+- Consideraciones:
+  - Los mensajes individuales igual quedan en `chat_messages` (SoR y CRM), por lo que no se pierde auditoría.
+  - El agente recibe el contexto concatenado en un solo turno, reduciendo latencia y evitando respuestas parciales.
+  - Mantener compatibilidad con media: siempre usar `processed_text` para agregar al buffer (no solo enlaces).
+
+---
+
+## 11. 🚀 Guía de Implementación en Producción (cuando finalicen pruebas)
+
+### 11.1. Despliegue del API Gateway (Express)
+- Contenedor: `express-gateway`
+- Variables clave:
+  - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
+  - `PYTHON_SERVICE_URL` (ej.: `http://python-service:8000` o dominio público)
+  - `REDIS_URL` (para caché de últimos mensajes)
+  - `LOG_LEVEL` (info|debug)
+- Recomendaciones:
+  - Recursos mínimos: 0.5 vCPU / 256–512 MB RAM
+  - Habilitar healthcheck y restart `always`
+  - Exponer solo puerto público del gateway
+
+### 11.2. Despliegue del Servicio Python (FastAPI + LangGraph)
+- Contenedor: `python-service`
+- Variables clave:
+  - `OPENAI_API_KEY`, `OPENAI_CHAT_MODEL` (ej.: gpt-4o)
+  - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
+  - `REDIS_URL` (checkpointing de LangGraph)
+  - (Opcional observabilidad LLM) `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`
+- Recomendaciones:
+  - Recursos mínimos: 1 vCPU / 512–1024 MB RAM
+  - Restart `always`, healthcheck en `/`
+  - Limitar `recursion_limit` y saneo de entradas
+
+### 11.3. Observabilidad (stack separado)
+- Compose independiente: `infra/observabilidad/docker-compose.observability.yml`
+- Servicios incluidos:
+  - `langfuse` + `langfuse-db` (Postgres dedicado)
+  - `loki`, `promtail`, `grafana` para logs del gateway
+- Red compartida: `skytidecrm-network` (external)
+- Puertos sugeridos:
+  - Langfuse UI: 3001
+  - Grafana: 3000
+  - Loki: 3100 (interno)
+- Recomendaciones de recursos (idle aproximado):
+  - Langfuse: 200–350 MB (según uso)
+  - Postgres (Langfuse): 150–300 MB
+  - Loki+Promtail: 150–250 MB
+  - Grafana: 100–200 MB
+
+### 11.4. Red, dominios y seguridad
+- Crear red Docker: `docker network create skytidecrm-network`
+- Asignar dominios/subdominios:
+  - Gateway público (ej.: `gw.tu-dominio.com`)
+  - Python-service (interno o protegido)
+  - Langfuse (solo interno o protegido por auth)
+  - Grafana (protegido por credenciales fuertes)
+- TLS/HTTPS: mediante EasyPanel/Traefik/Caddy/Nginx (según tu setup)
+
+### 11.5. Checklist de pre-producción
+- [ ] Entorno `.env` completo en ambos servicios
+- [ ] `REDIS_URL` operativo
+- [ ] Migraciones Supabase aplicadas (`processed_text`, `thread_summaries`, `message_status pending`)
+- [ ] Pruebas E2E (texto/audio/imagen, agendar/confirmar/cancelar)
+- [ ] Logs verificados en Grafana (si usas Loki) o Dozzle
+- [ ] Langfuse recibiendo runs (si habilitado)
+
+### 11.6. Operación y soporte
+- Dashboards recomendados:
+  - Latencia p50/p95 del gateway y del `/invoke`
+  - Errores por organización
+  - Throughput por hora
+  - Estados de mensaje (`pending/sent/failed`)
+- Mantenimiento:
+  - Actualizaciones semanales de dependencias
+  - Backups del Postgres de Langfuse
+  - Rotación de logs en Loki (retención 7–14 días)
+

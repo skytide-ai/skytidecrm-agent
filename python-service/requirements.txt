@@ -1,10 +1,12 @@
 fastapi
 uvicorn
 langgraph
-zep-cloud
+langgraph-checkpoint-redis
+redis
 python-dotenv
-pydantic-ai
 openai
+langchain-openai
 httpx
 supabase
-pytz 
+pytz
+langfuse>=2.40.0

@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "context7-win": {
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npm",
+        "exec",
+        "--yes",
+        "@upstash/context7-mcp",
+        "--",
+        "--transport",
+        "stdio"
+      ]
+    }
+  }
+}
