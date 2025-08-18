@@ -28,8 +28,6 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from .db import supabase_client, run_db
 from .memory import (
     get_last_messages as sb_get_last_messages,
-    get_context_block as sb_get_context_block,
-    upsert_thread_summary as sb_upsert_thread_summary,
 )
 from langchain_openai import ChatOpenAI
  
@@ -84,24 +82,6 @@ def _extract_final_ai_content(messages: List[BaseMessage]) -> Optional[str]:
     return getattr(last_ai_with_tools, "content", None)
 
 
-async def _maybe_update_thread_summary(organization_id: str, chat_identity_id: str, last_messages: List[Dict[str, Any]]):
-    """Genera y guarda un resumen del hilo cuando hay suficiente contexto.
-    Estrategia simple: si hay >= 8 mensajes recientes, generar resumen breve.
-    """
-    try:
-        if len(last_messages) < 8:
-            return
-        # Construir texto base
-        joined = "\n".join([f"{m.get('role')}: {m.get('content','')[:400]}" for m in last_messages][-20:])
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", "Resume de forma breve y factual la conversación, destacando: intención, datos clave (fechas/horas/servicio), decisiones y próximos pasos. Máx 120-160 palabras."),
-            ("user", joined),
-        ])
-        summary = (await (prompt | llm).ainvoke({})).content
-        if summary:
-            await sb_upsert_thread_summary(organization_id, chat_identity_id, summary)
-    except Exception as e:
-        print(f"⚠️ No se pudo actualizar el resumen del hilo: {e}")
 
 supervisor_prompt = ChatPromptTemplate.from_messages(
     [
@@ -117,9 +97,7 @@ Eres el supervisor de un sistema de agentes de IA para un centro de estética. T
 - `escalation`: Si el usuario explícitamente confirma que quiere hablar con un asesor (ej. "sí, quiero hablar con un asesor", "sí, por favor", "necesito ayuda humana").
 - `__end__`: Únicamente para despedidas explícitas (ej. "adiós", "chao") o cuando la conversación ha concluido.
 
-**Contexto (Memoria persistente):**
-{context_block}
-**Últimos mensajes (Memoria a Corto Plazo):**
+**Últimos mensajes:**
 {messages}
 Basado en el **último mensaje del usuario** y el contexto, decide el siguiente nodo."""),
         ("user", "{last_message}"),
@@ -142,7 +120,6 @@ async def supervisor_node(state: GlobalState) -> Dict[str, Any]:
     last_message = state["messages"][-1].content
     chain = supervisor_prompt | structured_llm_router
     route = await chain.ainvoke({
-        "context_block": state.get("context_block", "No hay resumen."),
         "messages": "\n".join([f"{type(m).__name__}: {m.content}" for m in state["messages"][-6:]]),
         "last_message": last_message,
     })
@@ -239,8 +216,6 @@ knowledge_agent_prompt = ChatPromptTemplate.from_messages(
     - Mantén el idioma original de la pregunta y su intención.
     - Usa únicamente `{organization_id}` y, si aplica, `service_id` tal cual vengan en el contexto.
 
-**Contexto:** {context_block}
-
 **Variables para herramientas (multitenancy):**
 - organization_id: {organization_id}
 - contact_id: {contact_id}
@@ -277,7 +252,6 @@ async def knowledge_node(state: GlobalState) -> Dict[str, Any]:
     print("--- 📚 NODO: Conocimiento (Informativo) ---")
     response = await knowledge_agent_runnable.ainvoke(
         {
-            "context_block": state.get("context_block", "No hay resumen."),
             "messages": state["messages"],
             "organization_id": state.get("organization_id"),
             "contact_id": state.get("contact_id"),
@@ -376,8 +350,6 @@ appointment_agent_prompt = ChatPromptTemplate.from_messages(
 - Hora: {selected_time}
 - Miembro seleccionado: {selected_member_id}
 - Slots disponibles cargados: {available_slots}
-**Contexto:** {context_block}
-
 **Variables para herramientas (multitenancy):**
 - organization_id: {organization_id}
 - contact_id: {contact_id}
@@ -463,7 +435,6 @@ async def appointment_node(state: GlobalState) -> Dict[str, Any]:
             "selected_member_id": state.get("selected_member_id"),
             "available_slots": state.get("available_slots"),
             "pending_assessment_service": state.get("pending_assessment_service"),
-            "context_block": state.get("context_block", "No hay resumen."),
             "messages": state["messages"],
             "organization_id": state.get("organization_id"),
             "contact_id": state.get("contact_id"),
@@ -1150,7 +1121,6 @@ async def invoke(payload: InvokePayload, request: Request):
                 first_name = contact_data.get("first_name", "Usuario")
                 last_name = contact_data.get("last_name", "")
 
-        context_block = await sb_get_context_block(session_id)
         
         # Importar las clases de mensajes al inicio (se necesitan en ambos casos)
         from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
@@ -1246,7 +1216,6 @@ async def invoke(payload: InvokePayload, request: Request):
             "phone": payload.phone,
             "phone_number": payload.phoneNumber,
             "country_code": payload.countryCode,
-            "context_block": context_block,
         }
         if payload.contactId:
             initial_state_data["contact_id"] = payload.contactId
@@ -1314,18 +1283,6 @@ async def invoke(payload: InvokePayload, request: Request):
         except Exception:
             pass
 
-        # Intentar actualizar el resumen del hilo de forma asíncrona (best-effort)
-        try:
-            # Ejecutar de forma no bloqueante para no añadir latencia a la respuesta
-            async def _bg_update():
-                try:
-                    last_msgs = await sb_get_last_messages(session_id, last_n=12)
-                    await _maybe_update_thread_summary(payload.organizationId, session_id, last_msgs)
-                except Exception:
-                    pass
-            asyncio.create_task(_bg_update())
-        except Exception:
-            pass
         return {"response": ai_response_content}
 
     except Exception as e:

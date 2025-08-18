@@ -32,7 +32,7 @@ WhatsApp → Gupshup → Express Gateway → Python Service (LangGraph)
 
 ### Memory & State Management
 
-**Conversation Memory**: Supabase (`chat_messages` table with `processed_text` for AI-processed media content, `thread_summaries` for conversation context)
+**Conversation Memory**: Supabase (`chat_messages` table with `processed_text` for AI-processed media content)
 **State Persistence**: MemorySaver checkpointer (in-memory for development)
 **Multi-tenant**: Organization-based data isolation
 
@@ -132,7 +132,6 @@ The Express Gateway handles media through `mediaProcessor.js`:
 ### Database Schema
 Core tables in Supabase:
 - `chat_messages`: Message history with `processed_text` for AI-processed content
-- `thread_summaries`: Conversation summaries for context
 - `appointments`: Booking data
 - `contacts`: Customer information
 - `platform_connections`: WhatsApp/Gupshup configuration

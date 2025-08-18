@@ -5,6 +5,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { createClient: createRedisClient } = require('redis');
 const { processMedia } = require('../utils/mediaProcessor');
 const { sendTextMessage } = require('../utils/gupshupApi');
+const { logWebhook, logError, logMedia, logResponse } = require('../utils/logger');
 
 // Cache para deduplicación
 const processedMessages = new Map();
