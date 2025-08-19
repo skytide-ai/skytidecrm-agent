@@ -36,19 +36,13 @@ LANGFUSE_ENABLED = bool(os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE
 lf_handler = None
 if LANGFUSE_ENABLED:
     try:
-        # Preferido en versiones recientes
-        from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
-        lf_handler = LangfuseCallbackHandler()
+        # Import correcto según documentación oficial de Langfuse
+        from langfuse.langchain import CallbackHandler
+        lf_handler = CallbackHandler()
         print("🛰️ Langfuse habilitado para trazas LLM")
-    except Exception:
-        try:
-            # Compatibilidad con layout anterior
-            from langfuse.callback.langchain import CallbackHandler as LangfuseCallbackHandler
-            lf_handler = LangfuseCallbackHandler()
-            print("🛰️ Langfuse habilitado para trazas LLM (compat)")
-        except Exception as _e:
-            lf_handler = None
-            print(f"⚠️ Langfuse deshabilitado (no se pudo importar CallbackHandler): {_e}")
+    except ImportError as e:
+        lf_handler = None
+        print(f"⚠️ Langfuse deshabilitado (no se pudo importar CallbackHandler): {e}")
 
 # --- 2. Supervisor y Enrutador ---
 # Eliminado CHECKPOINT_NS; no se usa con MemorySaver
