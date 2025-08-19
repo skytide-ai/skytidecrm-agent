@@ -5,6 +5,7 @@ langgraph-checkpoint-redis
 redis
 python-dotenv
 openai
+langchain
 langchain-openai
 httpx
 supabase
