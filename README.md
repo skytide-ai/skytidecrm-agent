@@ -118,6 +118,7 @@ GUPSHUP_NOTIF_APP_NAME=tu-app-name
 # Gateway
 GATEWAY_PORT=8080
 PYTHON_SERVICE_URL=http://python-service:8000
+AI_AGENT_ENABLED=true  # Desactivar agente IA temporalmente (false = solo procesa mensajes, no responde)
 ```
 
 ### 3. Configurar Base de Datos
@@ -497,10 +498,26 @@ Aunque no hay sistema de alertas automático, revisa regularmente:
 
 ### El agente no responde
 
-1. Verificar logs: `docker-compose logs -f python-service`
-2. Confirmar que Redis/MemorySaver está funcionando
-3. Verificar que las API keys son válidas
-4. Revisar que `chat_identities.bot_enabled = true`
+1. Verificar que `AI_AGENT_ENABLED=true` en variables de entorno del Gateway
+2. Verificar logs: `docker-compose logs -f python-service`
+3. Confirmar que Redis/MemorySaver está funcionando
+4. Verificar que las API keys son válidas
+5. Revisar que `chat_identities.bot_enabled = true` en la BD
+
+### Desactivar agente IA temporalmente (sin perder mensajes)
+
+Para desactivar el agente IA pero mantener el procesamiento de mensajes (transcripción de audio, guardado en BD, etc.):
+
+1. Cambiar variable de entorno en el Gateway:
+   ```
+   AI_AGENT_ENABLED=false
+   ```
+2. Reiniciar el servicio Gateway
+3. Los mensajes seguirán siendo:
+   - Recibidos y deduplicados
+   - Procesados (audio → texto, imágenes → descripción)
+   - Guardados en `chat_messages`
+4. El agente IA **no responderá** hasta que se reactive con `AI_AGENT_ENABLED=true`
 
 ### Mensajes duplicados
 

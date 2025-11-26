@@ -7,6 +7,10 @@ const { processMedia } = require('../utils/mediaProcessor');
 const { sendTextMessage } = require('../utils/gupshupApi');
 const { logWebhook, logError, logMedia, logResponse } = require('../utils/logger');
 
+// ⚠️ FLAG GLOBAL: Desactivar agente IA temporalmente (el procesamiento de mensajes sigue funcionando)
+// Variable de entorno: AI_AGENT_ENABLED=true para activar, cualquier otro valor o ausente = desactivado
+const AI_AGENT_ENABLED = process.env.AI_AGENT_ENABLED === 'true';
+
 // Cache para deduplicación
 const processedMessages = new Map();
 const DEDUP_TTL = 5 * 60 * 1000; // 5 minutos
@@ -332,7 +336,11 @@ router.post('/gupshup', async (req, res) => {
         }
       }
 
-      // Si el bot está deshabilitado para este chat, terminar aquí (solo persistimos el mensaje)
+      // Si el agente IA está desactivado globalmente o para este chat, terminar aquí (solo persistimos el mensaje)
+      if (!AI_AGENT_ENABLED) {
+        console.log(`⏸️ [${processingId}] AI_AGENT_ENABLED=false (global). Mensaje procesado y guardado, pero no se invoca al agente.`);
+        return;
+      }
       if (botEnabled === false) {
         console.log(`⏸️ [${processingId}] bot_enabled=false para chat_identity=${chatIdentityId}. No se invoca al agente.`);
         return;
