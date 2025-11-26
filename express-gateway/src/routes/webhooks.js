@@ -276,11 +276,17 @@ router.post('/gupshup', async (req, res) => {
       const incoming = req.body?.payload || {};
       const payloadInner = incoming?.payload || {};
       const msgType = incoming?.type || 'text';
-      let messageContent = payloadInner?.text || '[Mensaje multimedia]';
+      // Para quick_reply/button, el texto puede estar en text o postbackText
+      let messageContent = payloadInner?.text || payloadInner?.postbackText || '[Mensaje multimedia]';
       let processedText = messageContent;
       let mediaMeta = null; // { mediaUrl, mediaType, mimeType }
+
+      // Tipos que son esencialmente texto (no requieren procesamiento de media)
+      const textLikeTypes = ['text', 'quick_reply', 'button', 'interactive'];
+      const isTextLike = textLikeTypes.includes(msgType);
+
       try {
-        if (msgType && msgType !== 'text') {
+        if (msgType && !isTextLike) {
           // Para media, necesitamos pasar el tipo correcto y la URL
           const mediaPayload = {
             type: msgType,  // 'audio', 'image', 'video', etc.
@@ -318,7 +324,7 @@ router.post('/gupshup', async (req, res) => {
       const chatRow = {
         chat_identity_id: chatIdentityId,
         direction: 'incoming',
-        message: msgType === 'text' ? messageContent : '',
+        message: isTextLike ? messageContent : '',
         processed_text: processedText,
         media_type: dbMediaType || null,
         media_url: mediaMeta?.mediaUrl || null,
